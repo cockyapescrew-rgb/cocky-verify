@@ -1,7 +1,15 @@
 import { NextResponse } from "next/server";
 import { supabaseAdmin as supabase } from "@/lib/supabase";
 
+export const dynamic = "force-dynamic";
+export const maxDuration = 60;
+
 const XRPL_RPC = "https://xrplcluster.com";
+
+const XRPL_FETCH_TIMEOUT_MS = 12_000;
+const DISCORD_FETCH_TIMEOUT_MS = 10_000;
+const SUPABASE_CHUNK_SIZE = 100;
+const MAX_NFT_PAGES = 10;
 
 type OwnedNft = {
   nft_id: string;
@@ -19,6 +27,34 @@ type Trait = {
 
 function normalize(value: any) {
   return String(value || "").trim().toLowerCase();
+}
+
+function chunkArray<T>(items: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+
+  return chunks;
+}
+
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit = {},
+  timeoutMs = 10_000
+) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...init,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function decodeHexUri(uri?: string) {
@@ -93,12 +129,16 @@ async function fetchJsonMetadata(uri?: string) {
   if (!url) return null;
 
   try {
-    const res = await fetch(url, {
-      headers: {
-        Accept: "application/json",
+    const res = await fetchWithTimeout(
+      url,
+      {
+        headers: {
+          Accept: "application/json",
+        },
+        cache: "no-store",
       },
-      cache: "no-store",
-    });
+      8_000
+    );
 
     if (!res.ok) return null;
 
@@ -112,24 +152,28 @@ async function fetchWalletNfts(wallet: string): Promise<OwnedNft[]> {
   const owned: OwnedNft[] = [];
   let marker: any = undefined;
 
-  for (let i = 0; i < 20; i++) {
-    const res = await fetch(XRPL_RPC, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
+  for (let i = 0; i < MAX_NFT_PAGES; i++) {
+    const res = await fetchWithTimeout(
+      XRPL_RPC,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          method: "account_nfts",
+          params: [
+            {
+              account: wallet,
+              limit: 400,
+              marker,
+            },
+          ],
+        }),
+        cache: "no-store",
       },
-      body: JSON.stringify({
-        method: "account_nfts",
-        params: [
-          {
-            account: wallet,
-            limit: 400,
-            marker,
-          },
-        ],
-      }),
-      cache: "no-store",
-    });
+      XRPL_FETCH_TIMEOUT_MS
+    );
 
     const data = await res.json();
 
@@ -225,19 +269,28 @@ async function loadSavedMetadataForOwnedNfts(
 
   if (nftIds.length === 0) return ownedNfts;
 
-  const { data, error } = await supabase
-    .from("collection_nfts")
-    .select("*")
-    .eq("project_id", projectId)
-    .in("nft_id", nftIds);
+  const savedRows: any[] = [];
+  const nftIdChunks = chunkArray(nftIds, SUPABASE_CHUNK_SIZE);
 
-  if (error) {
-    throw new Error(error.message);
+  for (const nftIdChunk of nftIdChunks) {
+    const { data, error } = await supabase
+      .from("collection_nfts")
+      .select("*")
+      .eq("project_id", projectId)
+      .in("nft_id", nftIdChunk);
+
+    if (error) {
+      throw new Error(error.message);
+    }
+
+    if (data?.length) {
+      savedRows.push(...data);
+    }
   }
 
   const savedById = new Map<string, any>();
 
-  for (const row of data || []) {
+  for (const row of savedRows) {
     savedById.set(String(row.nft_id), row);
   }
 
@@ -261,14 +314,12 @@ async function loadSavedMetadataForOwnedNfts(
     }
 
     /*
-      Important:
-      Do NOT fetch live metadata/IPFS here during verification.
+      IMPORTANT:
+      Do NOT fetch live IPFS/metadata here.
 
-      This route runs when a user clicks "Refresh Discord Roles".
-      Fetching live metadata one NFT at a time can easily timeout on Vercel,
-      especially if the wallet owns many NFTs or IPFS is slow.
-
-      Metadata should be indexed ahead of time from the dashboard scan tools.
+      This route must be fast because it runs when a user clicks
+      "Refresh Discord Roles." Metadata should already be indexed
+      from the dashboard scan tools.
     */
   }
 
@@ -276,14 +327,15 @@ async function loadSavedMetadataForOwnedNfts(
 }
 
 async function addDiscordRole(guildId: string, userId: string, roleId: string) {
-  const res = await fetch(
+  const res = await fetchWithTimeout(
     `https://discord.com/api/v10/guilds/${guildId}/members/${userId}/roles/${roleId}`,
     {
       method: "PUT",
       headers: {
         Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}`,
       },
-    }
+    },
+    DISCORD_FETCH_TIMEOUT_MS
   );
 
   if (!res.ok) {
@@ -301,14 +353,15 @@ async function removeDiscordRole(
   userId: string,
   roleId: string
 ) {
-  const res = await fetch(
+  const res = await fetchWithTimeout(
     `https://discord.com/api/v10/guilds/${guildId}/members/${userId}/roles/${roleId}`,
     {
       method: "DELETE",
       headers: {
         Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}`,
       },
-    }
+    },
+    DISCORD_FETCH_TIMEOUT_MS
   );
 
   if (!res.ok && res.status !== 404) {
@@ -323,31 +376,39 @@ async function removeDiscordRole(
 
 async function sendUserDm(userId: string, message: string) {
   try {
-    const dmRes = await fetch("https://discord.com/api/v10/users/@me/channels", {
-      method: "POST",
-      headers: {
-        Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}`,
-        "Content-Type": "application/json",
+    const dmRes = await fetchWithTimeout(
+      "https://discord.com/api/v10/users/@me/channels",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          recipient_id: userId,
+        }),
       },
-      body: JSON.stringify({
-        recipient_id: userId,
-      }),
-    });
+      DISCORD_FETCH_TIMEOUT_MS
+    );
 
     const dm = await dmRes.json();
 
     if (!dmRes.ok || !dm?.id) return;
 
-    await fetch(`https://discord.com/api/v10/channels/${dm.id}/messages`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}`,
-        "Content-Type": "application/json",
+    await fetchWithTimeout(
+      `https://discord.com/api/v10/channels/${dm.id}/messages`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          content: message,
+        }),
       },
-      body: JSON.stringify({
-        content: message,
-      }),
-    });
+      DISCORD_FETCH_TIMEOUT_MS
+    );
   } catch {
     // DMs can fail if user has DMs disabled. Do not block verification.
   }
@@ -361,6 +422,12 @@ export async function POST(req: Request) {
     const provider = String(body.provider || "").trim();
     const discordUserId = String(body.discord_user_id || "").trim();
     const discordGuildId = String(body.discord_guild_id || "").trim();
+
+    console.log("VERIFY START", {
+      wallet,
+      discordUserId,
+      discordGuildId,
+    });
 
     if (!wallet) {
       return NextResponse.json(
@@ -387,11 +454,15 @@ export async function POST(req: Request) {
       );
     }
 
+    console.time("loadProject");
+
     const { data: project, error: projectError } = await supabase
       .from("projects")
       .select("*")
       .eq("discord_guild_id", discordGuildId)
       .single();
+
+    console.timeEnd("loadProject");
 
     if (projectError || !project) {
       return NextResponse.json(
@@ -403,6 +474,8 @@ export async function POST(req: Request) {
       );
     }
 
+    console.time("loadRules");
+
     const { data: rules, error: rulesError } = await supabase
       .from("role_rules")
       .select(
@@ -412,6 +485,8 @@ export async function POST(req: Request) {
       `
       )
       .eq("project_id", project.id);
+
+    console.timeEnd("loadRules");
 
     if (rulesError) {
       return NextResponse.json(
@@ -430,13 +505,25 @@ export async function POST(req: Request) {
       );
     }
 
+    console.time("fetchWalletNfts");
+
     let ownedNfts = await fetchWalletNfts(wallet);
+
+    console.timeEnd("fetchWalletNfts");
+    console.log("OWNED NFT COUNT", ownedNfts.length);
+
+    console.time("loadSavedMetadataForOwnedNfts");
+
     ownedNfts = await loadSavedMetadataForOwnedNfts(project.id, ownedNfts);
+
+    console.timeEnd("loadSavedMetadataForOwnedNfts");
 
     const rolesToAdd = new Set<string>();
     const rolesToRemove = new Set<string>();
     const matchedRoleNames: string[] = [];
     const failedRoleNames: string[] = [];
+
+    console.time("checkRules");
 
     for (const rule of rules) {
       const roleId = String(rule.discord_role_id || "").trim();
@@ -460,6 +547,17 @@ export async function POST(req: Request) {
       }
     }
 
+    console.timeEnd("checkRules");
+
+    console.log("ROLE DECISION", {
+      add: Array.from(rolesToAdd),
+      remove: Array.from(rolesToRemove),
+      matchedRoleNames,
+      failedRoleNames,
+    });
+
+    console.time("discordRoleUpdates");
+
     for (const roleId of rolesToAdd) {
       await addDiscordRole(discordGuildId, discordUserId, roleId);
       rolesToRemove.delete(roleId);
@@ -468,6 +566,10 @@ export async function POST(req: Request) {
     for (const roleId of rolesToRemove) {
       await removeDiscordRole(discordGuildId, discordUserId, roleId);
     }
+
+    console.timeEnd("discordRoleUpdates");
+
+    console.time("upsertVerifiedWallet");
 
     await supabase.from("verified_wallets").upsert(
       {
@@ -484,12 +586,15 @@ export async function POST(req: Request) {
       }
     );
 
+    console.timeEnd("upsertVerifiedWallet");
+
     if (matchedRoleNames.length > 0) {
       const message = `✅ Verified! Wallet linked and Discord roles updated: ${matchedRoleNames.join(
         ", "
       )}`;
 
-      await sendUserDm(discordUserId, message);
+      // Do not await DMs during verification. This keeps the API fast.
+      void sendUserDm(discordUserId, message);
 
       return NextResponse.json({
         success: true,
@@ -503,7 +608,8 @@ export async function POST(req: Request) {
     const failMessage =
       "❌ Verification checked, but no matching NFT, trait, or token requirement was found for this wallet.";
 
-    await sendUserDm(discordUserId, failMessage);
+    // Do not await DMs during verification. This keeps the API fast.
+    void sendUserDm(discordUserId, failMessage);
 
     return NextResponse.json({
       success: false,

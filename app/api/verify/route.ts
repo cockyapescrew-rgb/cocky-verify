@@ -45,7 +45,9 @@ function toHttpUri(uri?: string) {
   if (!decoded) return "";
 
   if (decoded.startsWith("ipfs://")) {
-    return decoded.replace("ipfs://", "https://ipfs.io/ipfs/").replaceAll("#", "%23");
+    return decoded
+      .replace("ipfs://", "https://ipfs.io/ipfs/")
+      .replaceAll("#", "%23");
   }
 
   return decoded.replaceAll("#", "%23");
@@ -132,7 +134,9 @@ async function fetchWalletNfts(wallet: string): Promise<OwnedNft[]> {
     const data = await res.json();
 
     if (!res.ok || data?.result?.error) {
-      throw new Error(data?.result?.error_message || "Failed to fetch wallet NFTs");
+      throw new Error(
+        data?.result?.error_message || "Failed to fetch wallet NFTs"
+      );
     }
 
     const nfts = data?.result?.account_nfts || [];
@@ -213,16 +217,23 @@ function requirementMatchesNfts(requirement: any, ownedNfts: OwnedNft[]) {
   return false;
 }
 
-async function loadSavedMetadataForOwnedNfts(projectId: string, ownedNfts: OwnedNft[]) {
+async function loadSavedMetadataForOwnedNfts(
+  projectId: string,
+  ownedNfts: OwnedNft[]
+) {
   const nftIds = ownedNfts.map((nft) => nft.nft_id).filter(Boolean);
 
   if (nftIds.length === 0) return ownedNfts;
 
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from("collection_nfts")
     .select("*")
     .eq("project_id", projectId)
     .in("nft_id", nftIds);
+
+  if (error) {
+    throw new Error(error.message);
+  }
 
   const savedById = new Map<string, any>();
 
@@ -233,30 +244,32 @@ async function loadSavedMetadataForOwnedNfts(projectId: string, ownedNfts: Owned
   for (const nft of ownedNfts) {
     const saved = savedById.get(nft.nft_id);
 
-    if (saved) {
-      const metadata =
-        saved.metadata ||
-        saved.metadata_json ||
-        saved.raw_metadata ||
-        saved.json ||
-        saved;
+    if (!saved) continue;
 
-      nft.metadata = metadata;
-      nft.traits = extractTraits(metadata);
+    const metadata =
+      saved.metadata ||
+      saved.metadata_json ||
+      saved.raw_metadata ||
+      saved.json ||
+      saved;
 
-      if (nft.traits.length === 0 && Array.isArray(saved.traits)) {
-        nft.traits = extractTraits({ attributes: saved.traits });
-      }
+    nft.metadata = metadata;
+    nft.traits = extractTraits(metadata);
+
+    if (nft.traits.length === 0 && Array.isArray(saved.traits)) {
+      nft.traits = extractTraits({ attributes: saved.traits });
     }
 
-    if (nft.traits.length === 0 && nft.uri) {
-      const liveMetadata = await fetchJsonMetadata(nft.uri);
+    /*
+      Important:
+      Do NOT fetch live metadata/IPFS here during verification.
 
-      if (liveMetadata) {
-        nft.metadata = liveMetadata;
-        nft.traits = extractTraits(liveMetadata);
-      }
-    }
+      This route runs when a user clicks "Refresh Discord Roles".
+      Fetching live metadata one NFT at a time can easily timeout on Vercel,
+      especially if the wallet owns many NFTs or IPFS is slow.
+
+      Metadata should be indexed ahead of time from the dashboard scan tools.
+    */
   }
 
   return ownedNfts;
@@ -283,7 +296,11 @@ async function addDiscordRole(guildId: string, userId: string, roleId: string) {
   }
 }
 
-async function removeDiscordRole(guildId: string, userId: string, roleId: string) {
+async function removeDiscordRole(
+  guildId: string,
+  userId: string,
+  roleId: string
+) {
   const res = await fetch(
     `https://discord.com/api/v10/guilds/${guildId}/members/${userId}/roles/${roleId}`,
     {

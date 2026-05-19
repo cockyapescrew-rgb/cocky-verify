@@ -25,6 +25,35 @@ type Trait = {
   value: string;
 };
 
+type RequirementResult = {
+  requirement_type: string;
+  issuer: string;
+  taxon: string;
+  collection_name: string;
+  passed: boolean;
+  found_count?: number;
+  required_count?: number;
+  trait_type?: string;
+  trait_value?: string;
+  matching_trait_count?: number;
+};
+
+type RuleResult = {
+  role_id: string;
+  role_name: string;
+  passed: boolean;
+  logic: "OR";
+  requirements: RequirementResult[];
+};
+
+type CollectionSummary = {
+  issuer: string;
+  taxon: string;
+  name: string;
+  owned_count: number;
+  indexed_count: number;
+};
+
 function normalize(value: any) {
   return String(value || "").trim().toLowerCase();
 }
@@ -55,38 +84,6 @@ async function fetchWithTimeout(
   } finally {
     clearTimeout(timeout);
   }
-}
-
-function decodeHexUri(uri?: string) {
-  if (!uri) return "";
-
-  try {
-    const clean = uri.trim();
-
-    if (clean.startsWith("http") || clean.startsWith("ipfs://")) return clean;
-
-    if (/^[0-9a-fA-F]+$/.test(clean)) {
-      return Buffer.from(clean, "hex").toString("utf8");
-    }
-
-    return clean;
-  } catch {
-    return uri || "";
-  }
-}
-
-function toHttpUri(uri?: string) {
-  const decoded = decodeHexUri(uri);
-
-  if (!decoded) return "";
-
-  if (decoded.startsWith("ipfs://")) {
-    return decoded
-      .replace("ipfs://", "https://ipfs.io/ipfs/")
-      .replaceAll("#", "%23");
-  }
-
-  return decoded.replaceAll("#", "%23");
 }
 
 function extractTraits(metadata: any): Trait[] {
@@ -121,31 +118,6 @@ function extractTraits(metadata: any): Trait[] {
   }
 
   return traits;
-}
-
-async function fetchJsonMetadata(uri?: string) {
-  const url = toHttpUri(uri);
-
-  if (!url) return null;
-
-  try {
-    const res = await fetchWithTimeout(
-      url,
-      {
-        headers: {
-          Accept: "application/json",
-        },
-        cache: "no-store",
-      },
-      8_000
-    );
-
-    if (!res.ok) return null;
-
-    return await res.json();
-  } catch {
-    return null;
-  }
 }
 
 async function fetchWalletNfts(wallet: string): Promise<OwnedNft[]> {
@@ -204,38 +176,67 @@ async function fetchWalletNfts(wallet: string): Promise<OwnedNft[]> {
   return owned;
 }
 
-function requirementMatchesNfts(requirement: any, ownedNfts: OwnedNft[]) {
-  const requirementType = normalize(requirement.requirement_type);
+function countMatchingCollectionNfts(requirement: any, ownedNfts: OwnedNft[]) {
   const issuer = normalize(requirement.issuer);
   const taxon = String(requirement.taxon || "").trim();
 
-  const matchingCollectionNfts = ownedNfts.filter((nft) => {
+  return ownedNfts.filter((nft) => {
     const issuerMatches = !issuer || normalize(nft.issuer) === issuer;
     const taxonMatches = !taxon || String(nft.taxon) === taxon;
 
     return issuerMatches && taxonMatches;
   });
+}
+
+function evaluateRequirement(requirement: any, ownedNfts: OwnedNft[]): RequirementResult {
+  const requirementType = normalize(requirement.requirement_type);
+  const matchingCollectionNfts = countMatchingCollectionNfts(requirement, ownedNfts);
+
+  const resultBase: RequirementResult = {
+    requirement_type: String(requirement.requirement_type || ""),
+    issuer: String(requirement.issuer || ""),
+    taxon: String(requirement.taxon || ""),
+    collection_name: String(requirement.collection_name || requirement.name || ""),
+    passed: false,
+  };
 
   if (requirementType === "nft_count") {
     const min = Number(requirement.min_nft_count || 1);
-    return matchingCollectionNfts.length >= min;
+    const found = matchingCollectionNfts.length;
+
+    return {
+      ...resultBase,
+      passed: found >= min,
+      found_count: found,
+      required_count: min,
+    };
   }
 
   if (requirementType === "trait") {
     const traitType = normalize(requirement.trait_type);
     const traitValue = normalize(requirement.trait_value);
 
-    return matchingCollectionNfts.some((nft) =>
-      nft.traits.some((trait) => {
-        const typeMatches =
-          !traitType || normalize(trait.trait_type) === traitType;
+    let matchingTraitCount = 0;
 
-        const valueMatches =
-          !traitValue || normalize(trait.value) === traitValue;
+    for (const nft of matchingCollectionNfts) {
+      const hasTrait = nft.traits.some((trait) => {
+        const typeMatches = !traitType || normalize(trait.trait_type) === traitType;
+        const valueMatches = !traitValue || normalize(trait.value) === traitValue;
 
         return typeMatches && valueMatches;
-      })
-    );
+      });
+
+      if (hasTrait) matchingTraitCount += 1;
+    }
+
+    return {
+      ...resultBase,
+      passed: matchingTraitCount > 0,
+      trait_type: String(requirement.trait_type || ""),
+      trait_value: String(requirement.trait_value || ""),
+      matching_trait_count: matchingTraitCount,
+      found_count: matchingCollectionNfts.length,
+    };
   }
 
   if (requirementType === "trait_count") {
@@ -243,22 +244,31 @@ function requirementMatchesNfts(requirement: any, ownedNfts: OwnedNft[]) {
     const traitValue = normalize(requirement.trait_value);
     const min = Number(requirement.min_nft_count || 1);
 
-    const count = matchingCollectionNfts.filter((nft) =>
-      nft.traits.some((trait) => {
-        const typeMatches =
-          !traitType || normalize(trait.trait_type) === traitType;
+    let matchingTraitCount = 0;
 
-        const valueMatches =
-          !traitValue || normalize(trait.value) === traitValue;
+    for (const nft of matchingCollectionNfts) {
+      const hasTrait = nft.traits.some((trait) => {
+        const typeMatches = !traitType || normalize(trait.trait_type) === traitType;
+        const valueMatches = !traitValue || normalize(trait.value) === traitValue;
 
         return typeMatches && valueMatches;
-      })
-    ).length;
+      });
 
-    return count >= min;
+      if (hasTrait) matchingTraitCount += 1;
+    }
+
+    return {
+      ...resultBase,
+      passed: matchingTraitCount >= min,
+      trait_type: String(requirement.trait_type || ""),
+      trait_value: String(requirement.trait_value || ""),
+      matching_trait_count: matchingTraitCount,
+      required_count: min,
+      found_count: matchingCollectionNfts.length,
+    };
   }
 
-  return false;
+  return resultBase;
 }
 
 async function loadSavedMetadataForOwnedNfts(
@@ -267,7 +277,12 @@ async function loadSavedMetadataForOwnedNfts(
 ) {
   const nftIds = ownedNfts.map((nft) => nft.nft_id).filter(Boolean);
 
-  if (nftIds.length === 0) return ownedNfts;
+  if (nftIds.length === 0) {
+    return {
+      ownedNfts,
+      savedRows: [] as any[],
+    };
+  }
 
   const savedRows: any[] = [];
   const nftIdChunks = chunkArray(nftIds, SUPABASE_CHUNK_SIZE);
@@ -323,7 +338,87 @@ async function loadSavedMetadataForOwnedNfts(
     */
   }
 
-  return ownedNfts;
+  return {
+    ownedNfts,
+    savedRows,
+  };
+}
+
+function buildCollectionSummary(ownedNfts: OwnedNft[], savedRows: any[]) {
+  const collectionMap = new Map<string, CollectionSummary>();
+
+  for (const nft of ownedNfts) {
+    const key = `${normalize(nft.issuer)}|${String(nft.taxon)}`;
+
+    const existing =
+      collectionMap.get(key) ||
+      ({
+        issuer: nft.issuer,
+        taxon: nft.taxon,
+        name: `Taxon ${nft.taxon}`,
+        owned_count: 0,
+        indexed_count: 0,
+      } satisfies CollectionSummary);
+
+    existing.owned_count += 1;
+
+    collectionMap.set(key, existing);
+  }
+
+  for (const row of savedRows) {
+    const issuer = String(row.issuer || row.nft_issuer || "");
+    const taxon = String(row.taxon || row.nft_taxon || "");
+    const key = `${normalize(issuer)}|${taxon}`;
+
+    const existing =
+      collectionMap.get(key) ||
+      ({
+        issuer,
+        taxon,
+        name: row.collection_name || row.name || `Taxon ${taxon || "Unknown"}`,
+        owned_count: 0,
+        indexed_count: 0,
+      } satisfies CollectionSummary);
+
+    existing.indexed_count += 1;
+
+    if (row.collection_name || row.name) {
+      existing.name = row.collection_name || row.name;
+    }
+
+    collectionMap.set(key, existing);
+  }
+
+  return Array.from(collectionMap.values()).sort((a, b) =>
+    a.name.localeCompare(b.name)
+  );
+}
+
+function buildTraitSummary(ownedNfts: OwnedNft[]) {
+  const traitMap = new Map<string, { trait_type: string; value: string; count: number }>();
+
+  for (const nft of ownedNfts) {
+    for (const trait of nft.traits) {
+      const key = `${normalize(trait.trait_type)}|${normalize(trait.value)}`;
+
+      const existing =
+        traitMap.get(key) ||
+        ({
+          trait_type: trait.trait_type,
+          value: trait.value,
+          count: 0,
+        });
+
+      existing.count += 1;
+      traitMap.set(key, existing);
+    }
+  }
+
+  return Array.from(traitMap.values()).sort((a, b) => {
+    const typeCompare = a.trait_type.localeCompare(b.trait_type);
+    if (typeCompare !== 0) return typeCompare;
+    return a.value.localeCompare(b.value);
+  });
 }
 
 async function addDiscordRole(guildId: string, userId: string, roleId: string) {
@@ -514,14 +609,22 @@ export async function POST(req: Request) {
 
     console.time("loadSavedMetadataForOwnedNfts");
 
-    ownedNfts = await loadSavedMetadataForOwnedNfts(project.id, ownedNfts);
+    const metadataResult = await loadSavedMetadataForOwnedNfts(project.id, ownedNfts);
+    ownedNfts = metadataResult.ownedNfts;
 
     console.timeEnd("loadSavedMetadataForOwnedNfts");
+
+    const collectionSummary = buildCollectionSummary(
+      ownedNfts,
+      metadataResult.savedRows
+    );
+    const traitSummary = buildTraitSummary(ownedNfts);
 
     const rolesToAdd = new Set<string>();
     const rolesToRemove = new Set<string>();
     const matchedRoleNames: string[] = [];
     const failedRoleNames: string[] = [];
+    const ruleResults: RuleResult[] = [];
 
     console.time("checkRules");
 
@@ -532,11 +635,24 @@ export async function POST(req: Request) {
 
       if (!roleId) continue;
 
+      const requirementResults = requirements.map((requirement: any) =>
+        evaluateRequirement(requirement, ownedNfts)
+      );
+
+      // IMPORTANT:
+      // Role rules are treated as OR.
+      // If the wallet passes any requirement, it gets the role.
       const passes =
-        requirements.length > 0 &&
-        requirements.every((requirement: any) =>
-          requirementMatchesNfts(requirement, ownedNfts)
-        );
+        requirementResults.length > 0 &&
+        requirementResults.some((requirement) => requirement.passed);
+
+      ruleResults.push({
+        role_id: roleId,
+        role_name: roleName,
+        passed: passes,
+        logic: "OR",
+        requirements: requirementResults,
+      });
 
       if (passes) {
         rolesToAdd.add(roleId);
@@ -569,9 +685,22 @@ export async function POST(req: Request) {
 
     console.timeEnd("discordRoleUpdates");
 
+    const scanSummary = {
+      wallet,
+      discord_user_id: discordUserId,
+      discord_guild_id: discordGuildId,
+      project_id: project.id,
+      project_name: project.name,
+      total_nfts_owned: ownedNfts.length,
+      indexed_nfts_found: metadataResult.savedRows.length,
+      collections: collectionSummary,
+      traits: traitSummary,
+      rules: ruleResults,
+    };
+
     console.time("upsertVerifiedWallet");
 
-    await supabase.from("verified_wallets").upsert(
+    const { error: upsertError } = await supabase.from("verified_wallets").upsert(
       {
         project_id: project.id,
         discord_guild_id: discordGuildId,
@@ -579,6 +708,7 @@ export async function POST(req: Request) {
         wallet_address: wallet,
         wallet_provider: provider || null,
         matched_roles: matchedRoleNames,
+        scan_summary: scanSummary,
         updated_at: new Date().toISOString(),
       },
       {
@@ -588,12 +718,15 @@ export async function POST(req: Request) {
 
     console.timeEnd("upsertVerifiedWallet");
 
+    if (upsertError) {
+      throw new Error(`Verified wallet save failed: ${upsertError.message}`);
+    }
+
     if (matchedRoleNames.length > 0) {
       const message = `✅ Verified! Wallet linked and Discord roles updated: ${matchedRoleNames.join(
         ", "
       )}`;
 
-      // Do not await DMs during verification. This keeps the API fast.
       void sendUserDm(discordUserId, message);
 
       return NextResponse.json({
@@ -602,13 +735,13 @@ export async function POST(req: Request) {
         matched_roles: matchedRoleNames,
         removed_roles: failedRoleNames,
         message,
+        scan_summary: scanSummary,
       });
     }
 
     const failMessage =
       "❌ Verification checked, but no matching NFT, trait, or token requirement was found for this wallet.";
 
-    // Do not await DMs during verification. This keeps the API fast.
     void sendUserDm(discordUserId, failMessage);
 
     return NextResponse.json({
@@ -617,6 +750,7 @@ export async function POST(req: Request) {
       matched_roles: [],
       removed_roles: failedRoleNames,
       error: failMessage,
+      scan_summary: scanSummary,
     });
   } catch (error: any) {
     console.error("VERIFY ROUTE ERROR:", error);

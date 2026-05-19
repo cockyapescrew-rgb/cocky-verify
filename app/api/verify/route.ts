@@ -644,7 +644,9 @@ export async function POST(req: Request) {
       // If the wallet passes any requirement, it gets the role.
       const passes =
         requirementResults.length > 0 &&
-        requirementResults.some((requirement) => requirement.passed);
+        requirementResults.some(
+          (requirement: RequirementResult) => requirement.passed
+        );
 
       ruleResults.push({
         role_id: roleId,

@@ -285,6 +285,130 @@ export default function SuperAdminPage() {
   const [expandedPaymentIds, setExpandedPaymentIds] = useState<string[]>([]);
   const [copiedValue, setCopiedValue] = useState("");
 
+  const [globalMonthlyXrp, setGlobalMonthlyXrp] = useState("15");
+  const [settingsLoading, setSettingsLoading] = useState(false);
+  const [settingsSaving, setSettingsSaving] = useState(false);
+  const [settingsMessage, setSettingsMessage] = useState("");
+  const [settingsError, setSettingsError] = useState("");
+
+  async function loadPlatformSettings() {
+    setSettingsLoading(true);
+    setSettingsError("");
+    setSettingsMessage("");
+
+    try {
+      const res = await fetch("/api/super-admin/settings/get", {
+        cache: "no-store",
+      });
+
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok || !data.success) {
+        setSettingsError(data.error || "Failed to load platform settings.");
+        return;
+      }
+
+      setGlobalMonthlyXrp(String(data.monthly_xrp_amount || 15));
+    } catch (err: any) {
+      console.error(err);
+      setSettingsError(err?.message || "Failed to load platform settings.");
+    } finally {
+      setSettingsLoading(false);
+    }
+  }
+
+  async function saveGlobalMonthlyPrice() {
+    setSettingsSaving(true);
+    setSettingsError("");
+    setSettingsMessage("");
+
+    try {
+      const res = await fetch("/api/super-admin/settings/update", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          monthly_xrp_amount: Number(globalMonthlyXrp || 15),
+        }),
+      });
+
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok || !data.success) {
+        setSettingsError(data.error || "Failed to save global monthly price.");
+        return;
+      }
+
+      setGlobalMonthlyXrp(String(data.monthly_xrp_amount || globalMonthlyXrp));
+      setSettingsMessage("Global monthly price saved.");
+    } catch (err: any) {
+      console.error(err);
+      setSettingsError(err?.message || "Failed to save global monthly price.");
+    } finally {
+      setSettingsSaving(false);
+    }
+  }
+
+  async function applyGlobalPriceToAllTenants() {
+    const confirmed = confirm(
+      `Apply ${globalMonthlyXrp || "15"} XRP as the monthly price for all existing tenants?`
+    );
+
+    if (!confirmed) return;
+
+    setSettingsSaving(true);
+    setSettingsError("");
+    setSettingsMessage("");
+
+    try {
+      const saveRes = await fetch("/api/super-admin/settings/update", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          monthly_xrp_amount: Number(globalMonthlyXrp || 15),
+        }),
+      });
+
+      const saveData = await saveRes.json().catch(() => ({}));
+
+      if (!saveRes.ok || !saveData.success) {
+        setSettingsError(
+          saveData.error || "Failed to save global monthly price."
+        );
+        return;
+      }
+
+      const applyRes = await fetch(
+        "/api/super-admin/settings/apply-monthly-price",
+        {
+          method: "POST",
+        }
+      );
+
+      const applyData = await applyRes.json().catch(() => ({}));
+
+      if (!applyRes.ok || !applyData.success) {
+        setSettingsError(
+          applyData.error || "Failed to apply global price to tenants."
+        );
+        return;
+      }
+
+      setSettingsMessage(
+        `Global price applied to ${applyData.updated_count || 0} tenants.`
+      );
+      await loadProjects();
+    } catch (err: any) {
+      console.error(err);
+      setSettingsError(err?.message || "Failed to apply global price.");
+    } finally {
+      setSettingsSaving(false);
+    }
+  }
+
   async function loadProjects() {
     setLoading(true);
     setAuthChecked(false);
@@ -339,6 +463,7 @@ export default function SuperAdminPage() {
 
   useEffect(() => {
     loadProjects();
+    loadPlatformSettings();
   }, []);
 
   const filteredProjects = useMemo(() => {
@@ -699,6 +824,69 @@ export default function SuperAdminPage() {
                 </p>
                 <p className="mt-2 text-4xl font-black">{expiredCount}</p>
               </div>
+            </section>
+
+            <section className="mt-6 rounded-3xl border border-[#3a2b16] bg-[#15110c] p-6">
+              <div className="flex flex-col gap-5 lg:flex-row lg:items-end lg:justify-between">
+                <div>
+                  <p className="text-xs font-black uppercase tracking-[0.35em] text-yellow-300">
+                    Platform Settings
+                  </p>
+
+                  <h2 className="mt-2 text-3xl font-black text-white">
+                    Global Subscription Price
+                  </h2>
+
+                  <p className="mt-2 max-w-2xl text-sm text-zinc-400">
+                    Set the default monthly XRP price across Cocky Portal. You can still
+                    manually override individual tenants below.
+                  </p>
+                </div>
+
+                <div className="grid gap-3 sm:grid-cols-[1fr_auto_auto]">
+                  <input
+                    value={globalMonthlyXrp}
+                    onChange={(e) => setGlobalMonthlyXrp(e.target.value)}
+                    placeholder="Monthly XRP"
+                    className="rounded-2xl border border-zinc-700 bg-black/60 px-5 py-3 text-sm font-bold text-white outline-none"
+                  />
+
+                  <button
+                    onClick={saveGlobalMonthlyPrice}
+                    disabled={settingsSaving || settingsLoading}
+                    className="rounded-2xl border border-yellow-400 bg-yellow-400/10 px-5 py-3 text-sm font-black uppercase text-yellow-300 hover:bg-yellow-400/20 disabled:opacity-60"
+                  >
+                    {settingsSaving ? "Saving..." : "Save Default"}
+                  </button>
+
+                  <button
+                    onClick={applyGlobalPriceToAllTenants}
+                    disabled={settingsSaving || settingsLoading}
+                    className="rounded-2xl bg-yellow-400 px-5 py-3 text-sm font-black uppercase text-black hover:bg-yellow-300 disabled:opacity-60"
+                  >
+                    Apply To All
+                  </button>
+                </div>
+              </div>
+
+              <div className="mt-4 rounded-2xl border border-zinc-800 bg-black/40 p-4 text-sm text-zinc-300">
+                Current global default:{" "}
+                <span className="font-black text-yellow-300">
+                  {globalMonthlyXrp || "15"} XRP / month
+                </span>
+              </div>
+
+              {settingsError && (
+                <div className="mt-4 rounded-2xl border border-red-500 bg-red-500/10 p-4 text-sm font-black text-red-300">
+                  {settingsError}
+                </div>
+              )}
+
+              {settingsMessage && (
+                <div className="mt-4 rounded-2xl border border-emerald-500 bg-emerald-500/10 p-4 text-sm font-black text-emerald-300">
+                  {settingsMessage}
+                </div>
+              )}
             </section>
 
             <section className="mt-6 rounded-3xl border border-[#3a2b16] bg-[#15110c] p-6">

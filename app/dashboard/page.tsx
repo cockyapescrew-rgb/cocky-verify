@@ -1,6 +1,8 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import CockyHeader from "@/app/components/CockyHeader";
+import CockyFooter from "@/app/components/CockyFooter";
 
 type DiscordUser = {
   id: string;
@@ -20,6 +22,25 @@ type Project = {
   name: string;
   owner_discord_id: string;
   discord_guild_id?: string | null;
+
+  billing_status?: string | null;
+  paid_until?: string | null;
+  billing_wallet?: string | null;
+  billing_destination_tag?: number | null;
+  billing_last_tx_hash?: string | null;
+  monthly_xrp_amount?: number | null;
+  admin_locked?: boolean | null;
+};
+
+type BillingPayment = {
+  uuid: string;
+  qr: string;
+  deepLink: string;
+  amount_xrp: number;
+  destination: string;
+  destination_tag: number;
+  memo: string;
+  expires_at: string;
 };
 
 export default function DashboardPage() {
@@ -30,12 +51,43 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(false);
   const [booting, setBooting] = useState(true);
 
+  const [billingLoading, setBillingLoading] = useState(false);
+  const [billingPayment, setBillingPayment] = useState<BillingPayment | null>(null);
+  const [billingMessage, setBillingMessage] = useState("");
+  const [billingError, setBillingError] = useState("");
+
+  const billingPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
   const linkedProjects = projects.filter((project) => project.discord_guild_id);
 
   const selectedGuildData = useMemo(
     () => guilds.find((guild) => guild.id === selectedGuild),
-    [guilds, selectedGuild]
+    [guilds, selectedGuild],
   );
+
+  const selectedProject = useMemo(
+    () =>
+      projects.find(
+        (project) =>
+          project.discord_guild_id &&
+          String(project.discord_guild_id) === String(selectedGuild),
+      ) || null,
+    [projects, selectedGuild],
+  );
+
+  const paidUntilLabel = selectedProject?.paid_until
+    ? new Date(selectedProject.paid_until).toLocaleString()
+    : "Not paid yet";
+
+  const isBillingActive = useMemo(() => {
+    if (!selectedProject) return false;
+    if (selectedProject.admin_locked) return false;
+    if (selectedProject.billing_status === "comped") return true;
+    if (selectedProject.billing_status !== "active") return false;
+    if (!selectedProject.paid_until) return false;
+
+    return new Date(selectedProject.paid_until).getTime() > Date.now();
+  }, [selectedProject]);
 
   async function loadDiscordUser() {
     try {
@@ -58,7 +110,9 @@ export default function DashboardPage() {
   }
 
   async function loadProjects(discordId: string) {
-    const res = await fetch(`/api/projects/list?discord_id=${discordId}`);
+    const res = await fetch(`/api/projects/list?discord_id=${discordId}`, {
+      cache: "no-store",
+    });
     const data = await res.json();
 
     if (data.projects) {
@@ -67,7 +121,7 @@ export default function DashboardPage() {
   }
 
   async function loadGuilds() {
-    const res = await fetch("/api/discord/guilds");
+    const res = await fetch("/api/discord/guilds", { cache: "no-store" });
     const data = await res.json();
 
     if (data.guilds) {
@@ -77,10 +131,17 @@ export default function DashboardPage() {
 
   useEffect(() => {
     loadDiscordUser();
+
+    return () => {
+      if (billingPollRef.current) {
+        clearInterval(billingPollRef.current);
+        billingPollRef.current = null;
+      }
+    };
   }, []);
 
   function connectDiscord() {
-    window.location.href = "/api/discord/login";
+    window.location.href = "/api/discord/login?return_to=/dashboard";
   }
 
   async function openServer() {
@@ -95,7 +156,7 @@ export default function DashboardPage() {
     }
 
     const existing = projects.find(
-      (project) => project.discord_guild_id === selectedGuild
+      (project) => project.discord_guild_id === selectedGuild,
     );
 
     if (existing) {
@@ -136,81 +197,180 @@ export default function DashboardPage() {
     setLoading(false);
   }
 
+  async function createXrpPayment(projectId: string) {
+    setBillingLoading(true);
+    setBillingError("");
+    setBillingMessage("");
+    setBillingPayment(null);
+
+    if (billingPollRef.current) {
+      clearInterval(billingPollRef.current);
+      billingPollRef.current = null;
+    }
+
+    try {
+      const res = await fetch("/api/billing/xrp/create-payment", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          project_id: projectId,
+        }),
+      });
+
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok || !data.success) {
+        setBillingError(data.error || "Failed to create XRP payment.");
+        return;
+      }
+
+      setBillingPayment(data);
+      setBillingMessage("Payment request created. Sign the XRP payment in Xaman.");
+
+      billingPollRef.current = setInterval(async () => {
+        await checkXrpPayment(data.uuid);
+      }, 2500);
+    } catch (err: any) {
+      console.error(err);
+      setBillingError(err?.message || "Failed to create XRP payment.");
+    } finally {
+      setBillingLoading(false);
+    }
+  }
+
+  async function checkXrpPayment(uuid: string) {
+    try {
+      const res = await fetch(`/api/billing/xrp/status/${uuid}`, {
+        cache: "no-store",
+      });
+
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok || !data.success) {
+        setBillingError(data.error || "Failed to check XRP payment.");
+        return;
+      }
+
+      if (data.paid) {
+        if (billingPollRef.current) {
+          clearInterval(billingPollRef.current);
+          billingPollRef.current = null;
+        }
+
+        setBillingMessage(`Payment confirmed. Paid until ${new Date(data.paid_until).toLocaleString()}.`);
+        setBillingPayment(null);
+
+        if (discordUser?.id) {
+          await loadProjects(discordUser.id);
+        }
+
+        return;
+      }
+
+      if (data.expired) {
+        if (billingPollRef.current) {
+          clearInterval(billingPollRef.current);
+          billingPollRef.current = null;
+        }
+
+        setBillingError("Payment request expired. Create a new payment request.");
+        return;
+      }
+
+      setBillingMessage("Waiting for XRP payment signature...");
+    } catch (err: any) {
+      console.error(err);
+      setBillingError(err?.message || "Failed to check XRP payment.");
+    }
+  }
+
+  function closeBillingPayment() {
+    if (billingPollRef.current) {
+      clearInterval(billingPollRef.current);
+      billingPollRef.current = null;
+    }
+
+    setBillingPayment(null);
+    setBillingLoading(false);
+  }
+
   const displayName =
     discordUser?.global_name || discordUser?.username || "Discord User";
 
-  const avatarUrl =
-    discordUser?.avatar && discordUser?.id
-      ? `https://cdn.discordapp.com/avatars/${discordUser.id}/${discordUser.avatar}.png`
-      : null;
-
   return (
-    <main className="min-h-screen bg-[#071310] px-5 py-6 text-[#fff4d8]">
-      <div className="mx-auto max-w-7xl">
-        <header className="mb-6 flex flex-wrap items-center justify-between gap-4 rounded-3xl border border-[#3a2b16] bg-[#15110c]/95 px-6 py-4 shadow-[0_0_40px_rgba(0,255,255,0.08)]">
-          <div className="flex items-center gap-4">
-            <img
-              src="/cblogo.png"
-              alt="Cocky.Cafe"
-              className="h-16 w-16 rounded-full border border-yellow-400 object-cover shadow-[0_0_22px_rgba(34,211,238,0.45)]"
-            />
+    <main className="min-h-screen bg-[#071310] pb-24 text-[#fff4d8]">
+      <CockyHeader
+        mode="dashboard"
+        discordName={discordUser ? displayName : ""}
+        showDiscordLogin={!discordUser && !booting}
+      />
 
-            <div>
-              <h1 className="text-3xl font-black leading-none">
-                <span className="text-yellow-400">Cocky</span>
-                <span className="text-cyan-400">.Cafe</span>
-              </h1>
+      {billingPayment && (
+        <div className="fixed inset-0 z-[1000] flex items-center justify-center bg-black/80 p-5 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-3xl border border-[#3a2b16] bg-[#15110c] p-6 text-center shadow-[0_0_50px_rgba(34,211,238,0.2)]">
+            <div className="flex items-center justify-between gap-4">
+              <h3 className="text-left text-2xl font-black text-white">
+                XRP Hosting Payment
+              </h3>
 
-              <p className="mt-1 text-sm text-zinc-400">
-                XRPL Discord verification dashboard
+              <button
+                onClick={closeBillingPayment}
+                className="rounded-full border border-red-500 px-3 py-1 text-xs font-black text-red-400"
+              >
+                Close
+              </button>
+            </div>
+
+            <div className="mt-5 rounded-2xl border border-emerald-500/40 bg-emerald-500/10 p-4 text-left">
+              <p className="text-xs font-black uppercase tracking-[0.2em] text-emerald-300">
+                Amount
+              </p>
+              <p className="mt-1 text-3xl font-black text-white">
+                {billingPayment.amount_xrp} XRP
+              </p>
+
+              <p className="mt-3 break-all text-xs text-zinc-400">
+                Memo: {billingPayment.memo}
+              </p>
+
+              <p className="mt-1 break-all text-xs text-zinc-500">
+                Tag: {billingPayment.destination_tag}
               </p>
             </div>
-          </div>
 
-          <div className="flex flex-wrap items-center gap-3">
-            {booting ? (
-              <div className="rounded-full border border-zinc-700 bg-black/50 px-5 py-3 text-xs font-black uppercase text-zinc-400">
-                Loading Discord...
-              </div>
-            ) : discordUser ? (
-              <div className="flex items-center gap-3 rounded-2xl border border-cyan-500/30 bg-black/50 px-4 py-3">
-                {avatarUrl ? (
-                  <img
-                    src={avatarUrl}
-                    alt={displayName}
-                    className="h-10 w-10 rounded-full"
-                  />
-                ) : (
-                  <div className="flex h-10 w-10 items-center justify-center rounded-full bg-cyan-500 font-black text-black">
-                    {displayName.slice(0, 1).toUpperCase()}
-                  </div>
-                )}
-
-                <div>
-                  <p className="text-xs font-black uppercase tracking-[0.25em] text-cyan-400">
-                    Connected Discord
-                  </p>
-                  <p className="font-black text-white">{displayName}</p>
-                </div>
-              </div>
-            ) : (
-              <button
-                onClick={connectDiscord}
-                className="rounded-full bg-[#5865F2] px-5 py-3 text-sm font-black uppercase text-white transition hover:brightness-110"
-              >
-                Connect Discord
-              </button>
+            {billingPayment.qr && (
+              <img
+                src={billingPayment.qr}
+                alt="Xaman payment QR"
+                className="mx-auto mt-6 h-64 w-64 rounded-2xl border border-zinc-800"
+              />
             )}
 
-            <a
-              href="/"
-              className="rounded-full border border-cyan-500 px-5 py-3 text-sm font-black uppercase text-cyan-400 hover:bg-cyan-500/10"
-            >
-              Verify Page
-            </a>
-          </div>
-        </header>
+            {billingPayment.deepLink && (
+              <a
+                href={billingPayment.deepLink}
+                className="mt-5 block rounded-2xl bg-yellow-400 py-4 text-lg font-black text-black hover:bg-yellow-300"
+              >
+                Open Xaman Payment
+              </a>
+            )}
 
+            <p className="mt-4 text-sm font-bold text-cyan-300">
+              {billingMessage || "Waiting for payment..."}
+            </p>
+
+            {billingError && (
+              <p className="mt-4 rounded-2xl border border-red-500/40 bg-red-500/10 p-3 text-sm font-black text-red-300">
+                {billingError}
+              </p>
+            )}
+          </div>
+        </div>
+      )}
+
+      <div className="mx-auto max-w-7xl px-5 py-6">
         <section className="relative overflow-hidden rounded-3xl border border-[#3a2b16] bg-black px-8 py-14 shadow-[0_0_55px_rgba(34,211,238,0.08)]">
           <video
             className="absolute inset-0 h-full w-full object-cover opacity-35"
@@ -252,7 +412,12 @@ export default function DashboardPage() {
 
               <select
                 value={selectedGuild}
-                onChange={(e) => setSelectedGuild(e.target.value)}
+                onChange={(e) => {
+                  setSelectedGuild(e.target.value);
+                  setBillingPayment(null);
+                  setBillingMessage("");
+                  setBillingError("");
+                }}
                 disabled={!discordUser || guilds.length === 0}
                 className="mt-5 w-full rounded-2xl border border-zinc-700 bg-black/70 px-5 py-4 text-lg font-black text-white outline-none disabled:cursor-not-allowed disabled:opacity-50"
               >
@@ -278,6 +443,61 @@ export default function DashboardPage() {
                   {selectedGuildData?.id || "Connect Discord and pick a server."}
                 </p>
               </div>
+
+              {selectedProject && (
+                <div className="mt-4 rounded-2xl border border-yellow-400/30 bg-yellow-400/10 p-4">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <p className="text-xs font-black uppercase tracking-[0.25em] text-yellow-300">
+                        Hosting Subscription
+                      </p>
+
+                      <p className="mt-2 text-sm font-bold text-zinc-300">
+                        Status:{" "}
+                        <span
+                          className={
+                            isBillingActive
+                              ? "text-emerald-300"
+                              : "text-red-300"
+                          }
+                        >
+                          {isBillingActive
+                            ? "Active"
+                            : selectedProject.billing_status || "Inactive"}
+                        </span>
+                      </p>
+
+                      <p className="mt-1 text-xs text-zinc-400">
+                        Paid until: {paidUntilLabel}
+                      </p>
+
+                      <p className="mt-1 text-xs text-zinc-500">
+                        Monthly: {selectedProject.monthly_xrp_amount || 25} XRP
+                      </p>
+                    </div>
+
+                    <button
+                      onClick={() => createXrpPayment(selectedProject.id)}
+                      disabled={billingLoading}
+                      className="rounded-2xl bg-yellow-400 px-5 py-3 text-sm font-black uppercase text-black hover:bg-yellow-300 disabled:opacity-60"
+                    >
+                      {billingLoading ? "Creating..." : "Pay 30 Days"}
+                    </button>
+                  </div>
+
+                  {billingMessage && !billingPayment && (
+                    <p className="mt-3 rounded-xl border border-cyan-500/40 bg-cyan-500/10 p-3 text-xs font-black text-cyan-300">
+                      {billingMessage}
+                    </p>
+                  )}
+
+                  {billingError && !billingPayment && (
+                    <p className="mt-3 rounded-xl border border-red-500/40 bg-red-500/10 p-3 text-xs font-black text-red-300">
+                      {billingError}
+                    </p>
+                  )}
+                </div>
+              )}
 
               <button
                 onClick={openServer}
@@ -318,10 +538,12 @@ export default function DashboardPage() {
             <p className="text-xs uppercase tracking-[0.3em] text-emerald-400">
               Flow
             </p>
-            <p className="mt-3 text-2xl font-black">Select → Open</p>
+            <p className="mt-3 text-2xl font-black">Select → Pay → Open</p>
           </div>
         </section>
       </div>
+
+      <CockyFooter />
     </main>
   );
 }

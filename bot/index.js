@@ -13,6 +13,9 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds],
 });
 
+const VERIFY_URL =
+  process.env.VERIFY_URL || "https://cocky-verify.vercel.app";
+
 client.once(Events.ClientReady, (bot) => {
   console.log(`Cocky Bot is online as ${bot.user.tag}`);
 });
@@ -21,10 +24,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
   if (interaction.commandName === "verifyportal") {
+    if (!interaction.guildId) {
+      await interaction.reply({
+        content: "Open this command inside a Discord server, not DMs.",
+        ephemeral: true,
+      });
+      return;
+    }
+
     const verifyUrl =
-      `https://cocky-verify.vercel.app` +
-      `?discord_id=${interaction.user.id}` +
-      `&guild_id=${interaction.guildId}`;
+      `${VERIFY_URL}` +
+      `?discord_id=${encodeURIComponent(interaction.user.id)}` +
+      `&guild_id=${encodeURIComponent(interaction.guildId)}`;
 
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder()

@@ -3,6 +3,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import SignClient from "@walletconnect/sign-client";
 import { WalletConnectModal } from "@walletconnect/modal";
+import CockyHeader from "@/app/components/CockyHeader";
+import CockyFooter from "@/app/components/CockyFooter";
 
 type Role = {
   id: string;
@@ -21,6 +23,17 @@ type Project = {
   name: string;
   owner_discord_id?: string;
   discord_guild_id?: string | null;
+
+  billing_status?: string | null;
+  paid_until?: string | null;
+  admin_locked?: boolean | null;
+  monthly_xrp_amount?: number | null;
+
+  tenant_image_url?: string | null;
+  tenant_image_path?: string | null;
+  tenant_image_updated_at?: string | null;
+  tenant_image_removed_by_admin?: boolean | null;
+  tenant_image_admin_note?: string | null;
 };
 
 type Collection = {
@@ -47,6 +60,9 @@ type Requirement = {
   min_nft_count: string;
   trait_type: string;
   trait_value: string;
+  token_currency: string;
+  token_issuer: string;
+  min_token_amount: string;
 };
 
 type RequirementGroup = {
@@ -62,6 +78,9 @@ type SavedRequirement = {
   min_nft_count?: number | null;
   trait_type?: string | null;
   trait_value?: string | null;
+  token_currency?: string | null;
+  token_issuer?: string | null;
+  min_token_amount?: number | null;
   logic?: string | null;
   group_id?: number | null;
   group_operator?: string | null;
@@ -109,26 +128,6 @@ type SingleScanResult = {
   details?: any;
 };
 
-const SOCIALS = [
-  { name: "Telegram", href: "https://t.me/cockyapes/1", icon: "/tg.png" },
-  {
-    name: "Discord",
-    href: "https://discord.gg/6eyJsfxq",
-    icon: "/discord.png",
-  },
-  { name: "X", href: "https://x.com/cockyapelaserco?s=21", icon: "/x.png" },
-  {
-    name: "Instagram",
-    href: "https://www.instagram.com/calco.cafe?igsh=NTc4MTIwNjQ2YQ%3D%3D&utm_source=qr",
-    icon: "/ig.png",
-  },
-  {
-    name: "TikTok",
-    href: "https://www.tiktok.com/@calco.cafe?_r=1&_t=ZP-96BEytbnaVb",
-    icon: "/tiktok.png",
-  },
-];
-
 const TRACKS = ["/lofi.mp3", "/lofi2.mp3", "/lofi3.mp3"];
 
 const WALLETCONNECT_PROJECT_ID =
@@ -159,6 +158,9 @@ function createBlankRequirement(): Requirement {
     min_nft_count: "1",
     trait_type: "",
     trait_value: "",
+    token_currency: "",
+    token_issuer: "",
+    min_token_amount: "1",
   };
 }
 
@@ -169,19 +171,42 @@ function createBlankGroup(groupId: number): RequirementGroup {
   };
 }
 
+function isProjectBillingActive(project: Project | null) {
+  if (!project) return false;
+
+  if (project.admin_locked) return false;
+
+  if (project.billing_status === "comped") return true;
+
+  if (project.billing_status !== "active") return false;
+
+  if (!project.paid_until) return false;
+
+  const paidUntil = new Date(project.paid_until).getTime();
+
+  if (Number.isNaN(paidUntil)) return false;
+
+  return paidUntil > Date.now();
+}
+
 export default function ProjectPage({
   params,
 }: {
   params: Promise<{ id: string }>;
 }) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const tenantImageInputRef = useRef<HTMLInputElement | null>(null);
   const xamanPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const walletConnectClientRef = useRef<SignClient | null>(null);
   const walletConnectModalRef = useRef<WalletConnectModal | null>(null);
   const walletConnectSessionTopicRef = useRef("");
 
   const [project, setProject] = useState<Project | null>(null);
+  const [projectLoaded, setProjectLoaded] = useState(false);
   const [discordUser, setDiscordUser] = useState<DiscordUser | null>(null);
+  const [tenantImageUploading, setTenantImageUploading] = useState(false);
+  const [tenantImageMessage, setTenantImageMessage] = useState("");
+  const [tenantImageError, setTenantImageError] = useState("");
 
   const [roles, setRoles] = useState<Role[]>([]);
   const [savedRules, setSavedRules] = useState<SavedRule[]>([]);
@@ -217,8 +242,6 @@ export default function ProjectPage({
     "xaman",
   );
 
-  const [tipAmount, setTipAmount] = useState("5");
-
   const [requirementGroups, setRequirementGroups] = useState<
     RequirementGroup[]
   >([createBlankGroup(1)]);
@@ -231,11 +254,6 @@ export default function ProjectPage({
 
   const discordDisplayName =
     discordUser?.global_name || discordUser?.username || "Discord User";
-
-  const discordAvatarUrl =
-    discordUser?.avatar && discordUser?.id
-      ? `https://cdn.discordapp.com/avatars/${discordUser.id}/${discordUser.avatar}.png`
-      : null;
 
   const sortedRoles = useMemo(() => {
     return [...roles].sort((a, b) => a.name.localeCompare(b.name));
@@ -386,19 +404,34 @@ export default function ProjectPage({
   async function loadProject() {
     const { id } = await params;
 
-    const projectRes = await fetch(`/api/projects/get?id=${id}`);
-    const projectData = await projectRes.json();
+    setProjectLoaded(false);
 
-    if (projectData.project) {
-      setProject(projectData.project);
+    try {
+      const projectRes = await fetch(`/api/projects/get?id=${id}`, {
+        cache: "no-store",
+      });
+      const projectData = await projectRes.json();
+      const loadedProject = projectData.project || null;
+
+      setProject(loadedProject);
+
+      if (!loadedProject || !isProjectBillingActive(loadedProject)) {
+        setRoles([]);
+        setCollections([]);
+        setTraits([]);
+        setSavedRules([]);
+        return;
+      }
+
+      if (loadedProject.discord_guild_id) {
+        await loadRoles(loadedProject.discord_guild_id);
+      }
+
+      await loadCollections();
+      await loadRules();
+    } finally {
+      setProjectLoaded(true);
     }
-
-    if (projectData.project?.discord_guild_id) {
-      await loadRoles(projectData.project.discord_guild_id);
-    }
-
-    await loadCollections();
-    await loadRules();
   }
 
   async function loadCollections() {
@@ -652,38 +685,51 @@ export default function ProjectPage({
     }
   }
 
-  async function createTip() {
-    try {
-      setWalletMode("tip");
-      setWalletModalTitle(`Send ${tipAmount || "0"} XRP Tip`);
-      setWalletLoading(true);
-      setWalletModalOpen(true);
-      setWalletQr("");
-      setWalletDeepLink("");
+  async function uploadTenantImage(file: File) {
+    if (!project?.id) return;
 
-      const res = await fetch("/api/tips/xaman", {
+    setTenantImageUploading(true);
+    setTenantImageMessage("");
+    setTenantImageError("");
+
+    try {
+      const formData = new FormData();
+      formData.append("project_id", project.id);
+      formData.append("image", file);
+
+      const res = await fetch("/api/projects/upload-image", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ amount: tipAmount }),
+        body: formData,
       });
 
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
 
-      if (!data.success) {
-        alert(
-          data.details || data.error || "Failed to create XRP tip transaction",
-        );
-        setWalletLoading(false);
+      if (!res.ok || !data.success) {
+        setTenantImageError(data.error || "Failed to upload server image.");
         return;
       }
 
-      setWalletQr(data.qr || "");
-      setWalletDeepLink(data.deepLink || "");
-      setWalletLoading(false);
-    } catch (err) {
+      setProject((current) =>
+        current
+          ? {
+              ...current,
+              tenant_image_url: data.tenant_image_url,
+              tenant_image_path: data.tenant_image_path,
+              tenant_image_removed_by_admin: false,
+              tenant_image_updated_at: new Date().toISOString(),
+            }
+          : current,
+      );
+
+      setTenantImageMessage("Server image updated.");
+    } catch (err: any) {
       console.error(err);
-      setWalletLoading(false);
-      alert("Failed to create XRP tip transaction");
+      setTenantImageError(err?.message || "Failed to upload server image.");
+    } finally {
+      setTenantImageUploading(false);
+      if (tenantImageInputRef.current) {
+        tenantImageInputRef.current.value = "";
+      }
     }
   }
 
@@ -876,6 +922,12 @@ export default function ProjectPage({
       }`;
     }
 
+    if (req.requirement_type === "token_quantity") {
+      return `Token Quantity • ${req.token_currency || "TOKEN"} • Min ${
+        req.min_token_amount || "1"
+      }`;
+    }
+
     return `NFT Quantity • ${collection} • Min ${
       req.min_nft_count || "1"
     }`;
@@ -1041,6 +1093,9 @@ export default function ProjectPage({
               min_nft_count: String(req.min_nft_count || 1),
               trait_type: req.trait_type || "",
               trait_value: req.trait_value || "",
+              token_currency: req.token_currency || "",
+              token_issuer: req.token_issuer || "",
+              min_token_amount: String(req.min_token_amount || 1),
             })),
           }))
         : [createBlankGroup(1)];
@@ -1106,14 +1161,44 @@ export default function ProjectPage({
 
     const cleanedRequirements = requirementGroups.flatMap((group) =>
       group.requirements
-        .filter((req) => req.issuer)
+        .filter((req) => {
+          if (req.requirement_type === "token_quantity") {
+            return req.token_currency && req.token_issuer;
+          }
+
+          return req.issuer;
+        })
         .map((req) => ({
           requirement_type: req.requirement_type,
-          issuer: req.issuer,
-          taxon: req.taxon || null,
-          min_nft_count: Number(req.min_nft_count || 1),
+
+          issuer:
+            req.requirement_type === "token_quantity" ? null : req.issuer,
+          taxon:
+            req.requirement_type === "token_quantity"
+              ? null
+              : req.taxon || null,
+          min_nft_count:
+            req.requirement_type === "token_quantity"
+              ? null
+              : Number(req.min_nft_count || 1),
+
           trait_type: req.requirement_type === "trait" ? req.trait_type : null,
-          trait_value: req.requirement_type === "trait" ? req.trait_value : null,
+          trait_value:
+            req.requirement_type === "trait" ? req.trait_value : null,
+
+          token_currency:
+            req.requirement_type === "token_quantity"
+              ? req.token_currency
+              : null,
+          token_issuer:
+            req.requirement_type === "token_quantity"
+              ? req.token_issuer
+              : null,
+          min_token_amount:
+            req.requirement_type === "token_quantity"
+              ? Number(req.min_token_amount || 1)
+              : null,
+
           logic: "OR",
           group_id: group.group_id,
           group_operator: "AND",
@@ -1158,8 +1243,14 @@ export default function ProjectPage({
   }
 
   return (
-    <main className="min-h-screen bg-[#071310] px-5 py-6 pb-40 text-[#fff4d8]">
+    <main className="min-h-screen bg-[#071310] pb-40 text-[#fff4d8]">
       <audio ref={audioRef} onEnded={nextTrack} preload="none" />
+
+      <CockyHeader
+        mode="project"
+        discordName={discordUser ? discordDisplayName : ""}
+        showDiscordLogin={!discordUser}
+      />
 
       {walletModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-5 backdrop-blur-sm">
@@ -1263,114 +1354,106 @@ export default function ProjectPage({
         </div>
       )}
 
-      <div className="mx-auto max-w-7xl">
-        <header className="mb-6 flex flex-wrap items-center justify-between gap-4 rounded-3xl border border-[#3a2b16] bg-[#15110c]/95 px-6 py-4 shadow-[0_0_40px_rgba(0,255,255,0.08)]">
-          <div className="flex items-center gap-4">
-            <img
-              src="/cblogo.png"
-              alt="Cocky.Cafe"
-              className="h-16 w-16 rounded-full border border-yellow-400 object-cover shadow-[0_0_22px_rgba(34,211,238,0.45)]"
-            />
+      {!projectLoaded && (
+        <>
+          <div className="mx-auto max-w-4xl px-5 py-10">
+            <div className="rounded-3xl border border-cyan-500/40 bg-[#15110c] p-8 text-center shadow-[0_0_40px_rgba(34,211,238,0.12)]">
+              <p className="text-xs font-black uppercase tracking-[0.35em] text-cyan-300">
+                Checking Project Access
+              </p>
 
-            <div>
-              <h1 className="text-3xl font-black leading-none">
-                <span className="text-yellow-400">Cocky</span>
-                <span className="text-cyan-400">.Cafe</span>
+              <h1 className="mt-4 text-4xl font-black text-white">
+                Loading server access...
               </h1>
-              <p className="mt-1 text-sm text-zinc-400">
-                Powered by CALCo • XRPL access dashboard
+
+              <p className="mx-auto mt-4 max-w-xl text-sm text-zinc-400">
+                Project tools are hidden until billing and access are checked.
               </p>
             </div>
           </div>
 
-          <div className="flex flex-wrap items-center gap-3">
-            {discordUser && (
-              <div className="flex items-center gap-3 rounded-2xl border border-cyan-500/30 bg-black/50 px-4 py-3">
-                {discordAvatarUrl ? (
-                  <img
-                    src={discordAvatarUrl}
-                    alt="Discord Avatar"
-                    className="h-10 w-10 rounded-full"
-                  />
-                ) : (
-                  <div className="flex h-10 w-10 items-center justify-center rounded-full bg-cyan-500 font-black text-black">
-                    {discordDisplayName.slice(0, 1).toUpperCase()}
-                  </div>
-                )}
+          <CockyFooter />
+        </>
+      )}
 
-                <div>
-                  <p className="text-xs font-black uppercase tracking-[0.25em] text-cyan-400">
-                    Connected Discord
-                  </p>
-                  <p className="font-black text-white">{discordDisplayName}</p>
-                </div>
-              </div>
-            )}
+      {projectLoaded && !project && (
+        <>
+          <div className="mx-auto max-w-4xl px-5 py-10">
+            <div className="rounded-3xl border border-red-500/50 bg-[#15110c] p-8 text-center shadow-[0_0_40px_rgba(239,68,68,0.12)]">
+              <p className="text-xs font-black uppercase tracking-[0.35em] text-red-300">
+                Project Not Found
+              </p>
 
-            <a
-              href="https://claims.cafe"
-              target="_blank"
-              rel="noreferrer"
-              className="rounded-full bg-yellow-400 px-5 py-3 text-sm font-black uppercase text-black hover:bg-yellow-300"
-            >
-              Claims.Cafe
-            </a>
+              <h1 className="mt-4 text-4xl font-black text-white">
+                This server project could not be loaded.
+              </h1>
 
-            {wallet ? (
-              <div className="flex items-center gap-2 rounded-full border border-emerald-400/50 bg-black/55 py-1.5 pl-2 pr-2 shadow-[0_0_22px_rgba(16,185,129,0.12)]">
-                <div className="flex items-center gap-2 rounded-full bg-emerald-500/10 px-3 py-2">
-                  <span className="h-2.5 w-2.5 rounded-full bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.9)]" />
-                  <img
-                    src={walletProvider === "joey" ? "/joey.png" : "/xaman.png"}
-                    alt={walletProvider === "joey" ? "Joey" : "Xaman"}
-                    className="h-5 w-5"
-                  />
-                  <div className="leading-none">
-                    <p className="text-[10px] font-black uppercase tracking-[0.18em] text-emerald-300">
-                      Connected Wallet
-                    </p>
-                    <p className="mt-1 font-mono text-xs font-black text-white">
-                      {shortWallet(wallet)}
-                    </p>
-                  </div>
-                </div>
+              <p className="mx-auto mt-4 max-w-xl text-sm text-zinc-400">
+                Go back to the dashboard and select a configured Discord server.
+              </p>
 
-                <button
-                  onClick={disconnectWallet}
-                  className="rounded-full border border-red-500/50 px-3 py-2 text-[10px] font-black uppercase text-red-300 hover:bg-red-500/10"
-                >
-                  Disconnect
-                </button>
-              </div>
-            ) : (
-              <>
-                <button
-                  onClick={connectXaman}
-                  className="flex items-center gap-2 rounded-full border border-emerald-500 bg-emerald-500/10 px-4 py-2 text-xs font-black uppercase text-emerald-300 hover:bg-emerald-500/20"
-                >
-                  <img src="/xaman.png" alt="Xaman" className="h-5 w-5" />
-                  Xaman
-                </button>
-
-                <button
-                  onClick={connectJoey}
-                  className="flex items-center gap-2 rounded-full border border-cyan-500 bg-cyan-500/10 px-4 py-2 text-xs font-black uppercase text-cyan-300 hover:bg-cyan-500/20"
-                >
-                  <img src="/joey.png" alt="Joey" className="h-5 w-5" />
-                  Joey
-                </button>
-              </>
-            )}
-
-            <a
-              href="/dashboard"
-              className="rounded-full border border-cyan-500 px-5 py-3 text-sm font-black uppercase text-cyan-400 hover:bg-cyan-500/10"
-            >
-              Dashboard
-            </a>
+              <a
+                href="/dashboard"
+                className="mt-6 inline-flex rounded-2xl bg-cyan-400 px-6 py-4 text-sm font-black uppercase text-black hover:bg-cyan-300"
+              >
+                Go To Dashboard
+              </a>
+            </div>
           </div>
-        </header>
 
+          <CockyFooter />
+        </>
+      )}
+
+      {projectLoaded && project && !isProjectBillingActive(project) && (
+        <>
+          <div className="mx-auto max-w-4xl px-5 py-10">
+            <div className="rounded-3xl border border-yellow-400/50 bg-[#15110c] p-8 text-center shadow-[0_0_40px_rgba(250,204,21,0.12)]">
+              <p className="text-xs font-black uppercase tracking-[0.35em] text-yellow-300">
+                Project Locked
+              </p>
+
+              <h1 className="mt-4 text-4xl font-black text-white">
+                Hosting subscription inactive.
+              </h1>
+
+              <p className="mx-auto mt-4 max-w-xl text-sm text-zinc-400">
+                This server’s Cocky Portal tools are hidden until hosting is active.
+                Renew from the dashboard to manage scans, traits, and role rules.
+              </p>
+
+              <div className="mx-auto mt-5 max-w-xl rounded-2xl border border-zinc-800 bg-black/50 p-4 text-left">
+                <p className="text-sm font-black text-white">{project.name}</p>
+
+                <p className="mt-2 text-xs text-zinc-500">
+                  Status: {project.billing_status || "inactive"}
+                </p>
+
+                <p className="mt-1 text-xs text-zinc-500">
+                  Paid until: {project.paid_until ? new Date(project.paid_until).toLocaleString() : "Not paid"}
+                </p>
+
+                <p className="mt-1 text-xs text-zinc-500">
+                  Admin locked: {project.admin_locked ? "Yes" : "No"}
+                </p>
+              </div>
+
+              <a
+                href="/dashboard"
+                className="mt-6 inline-flex rounded-2xl bg-yellow-400 px-6 py-4 text-sm font-black uppercase text-black hover:bg-yellow-300"
+              >
+                Go To Dashboard To Pay
+              </a>
+            </div>
+          </div>
+
+          <CockyFooter />
+        </>
+      )}
+
+      {projectLoaded && project && isProjectBillingActive(project) && (
+        <>
+      <div className="mx-auto max-w-7xl px-5 py-6">
         <section className="relative overflow-hidden rounded-3xl border border-[#3a2b16] bg-black px-8 py-14 shadow-[0_0_55px_rgba(34,211,238,0.08)]">
           <video
             className="absolute inset-0 h-full w-full object-cover opacity-35"
@@ -1430,31 +1513,101 @@ export default function ProjectPage({
               ))}
             </select>
 
-            <div className="mt-6 rounded-3xl border border-emerald-500/40 bg-emerald-500/10 p-5">
-              <p className="text-xs font-black uppercase tracking-[0.25em] text-emerald-400">
-                XRP Tip Jar
+            <div className="mt-6 rounded-3xl border border-cyan-500/30 bg-cyan-500/10 p-5">
+              <p className="text-xs font-black uppercase tracking-[0.25em] text-cyan-300">
+                Server Image
+              </p>
+
+              <div className="mt-4 flex flex-col gap-4 sm:flex-row sm:items-center">
+                <div className="flex h-24 w-24 shrink-0 items-center justify-center overflow-hidden rounded-2xl border border-zinc-800 bg-black/60">
+                  {project?.tenant_image_url ? (
+                    <img
+                      src={project.tenant_image_url}
+                      alt={project.name || "Server"}
+                      className="h-full w-full object-cover"
+                    />
+                  ) : (
+                    <span className="text-3xl font-black text-cyan-300">
+                      {(project?.name || "S").slice(0, 1).toUpperCase()}
+                    </span>
+                  )}
+                </div>
+
+                <div className="flex-1">
+                  <p className="text-sm text-zinc-400">
+                    Upload a clean server logo/image.
+                  </p>
+
+                  {project?.tenant_image_removed_by_admin && (
+                    <p className="mt-3 rounded-xl border border-red-500/40 bg-red-500/10 p-3 text-xs font-black text-red-300">
+                      Image was removed by super admin. {project.tenant_image_admin_note || ""}
+                    </p>
+                  )}
+
+                  <input
+                    ref={tenantImageInputRef}
+                    type="file"
+                    accept="image/png,image/jpeg,image/webp,image/gif"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      if (file) void uploadTenantImage(file);
+                    }}
+                    disabled={tenantImageUploading}
+                    className="mt-4 block w-full cursor-pointer rounded-2xl border border-zinc-700 bg-black/60 px-4 py-3 text-sm font-bold text-zinc-300 file:mr-4 file:rounded-xl file:border-0 file:bg-cyan-400 file:px-4 file:py-2 file:text-xs file:font-black file:uppercase file:text-black disabled:opacity-60"
+                  />
+
+                  {tenantImageMessage && (
+                    <p className="mt-3 rounded-xl border border-emerald-500/40 bg-emerald-500/10 p-3 text-xs font-black text-emerald-300">
+                      {tenantImageMessage}
+                    </p>
+                  )}
+
+                  {tenantImageError && (
+                    <p className="mt-3 rounded-xl border border-red-500/40 bg-red-500/10 p-3 text-xs font-black text-red-300">
+                      {tenantImageError}
+                    </p>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-6 rounded-3xl border border-yellow-400/30 bg-yellow-400/10 p-5">
+              <p className="text-xs font-black uppercase tracking-[0.25em] text-yellow-300">
+                Hosting Status
               </p>
 
               <p className="mt-2 text-sm text-zinc-400">
-                Enjoying the tools? Send a small XRP tip to help support
-                Cocky.Cafe development, bots, rewards, and future features.
+                Project tools are available while this server’s Cocky Portal
+                hosting is active. Renew or manage billing from the dashboard.
               </p>
 
-              <div className="mt-4 flex flex-col gap-3">
-                <input
-                  value={tipAmount}
-                  onChange={(e) => setTipAmount(e.target.value)}
-                  placeholder="Tip amount in XRP"
-                  className="w-full rounded-2xl border border-zinc-700 bg-black/60 px-5 py-4 text-base font-bold text-white outline-none"
-                />
+              <div className="mt-4 rounded-2xl border border-zinc-800 bg-black/40 p-4">
+                <p className="text-xs font-black uppercase tracking-[0.2em] text-zinc-500">
+                  Current Server
+                </p>
 
-                <button
-                  onClick={createTip}
-                  className="rounded-2xl bg-emerald-500 px-6 py-4 text-sm font-black uppercase text-black hover:bg-emerald-400"
-                >
-                  Send XRP Tip
-                </button>
+                <p className="mt-2 text-sm font-black text-white">
+                  {project?.name || "Loaded Project"}
+                </p>
+
+                <p className="mt-1 text-xs text-zinc-500">
+                  Status: {project?.billing_status || "inactive"}
+                </p>
+
+                <p className="mt-1 text-xs text-zinc-500">
+                  Paid until:{" "}
+                  {project?.paid_until
+                    ? new Date(project.paid_until).toLocaleString()
+                    : "Not paid"}
+                </p>
               </div>
+
+              <a
+                href="/dashboard"
+                className="mt-4 inline-flex w-full justify-center rounded-2xl bg-yellow-400 px-6 py-4 text-sm font-black uppercase text-black hover:bg-yellow-300"
+              >
+                Manage Billing
+              </a>
             </div>
           </div>
 
@@ -1822,21 +1975,47 @@ export default function ProjectPage({
                                       <p className="text-xs font-black uppercase tracking-[0.25em] text-cyan-400">
                                         {req.requirement_type === "trait"
                                           ? "Trait Gate"
-                                          : "NFT Quantity"}
+                                          : req.requirement_type ===
+                                              "token_quantity"
+                                            ? "Token Quantity"
+                                            : "NFT Quantity"}
                                       </p>
 
-                                      <p className="mt-2 text-sm text-zinc-300">
-                                        {collectionLabel(req.issuer, req.taxon)}
-                                      </p>
-
-                                      {req.requirement_type === "trait" ? (
-                                        <p className="mt-1 text-sm text-zinc-400">
-                                          {req.trait_type}: {req.trait_value}
-                                        </p>
+                                      {req.requirement_type ===
+                                      "token_quantity" ? (
+                                        <>
+                                          <p className="mt-2 text-sm text-zinc-300">
+                                            {req.token_currency || "TOKEN"}
+                                          </p>
+                                          <p className="mt-1 break-all text-sm text-zinc-400">
+                                            Issuer: {req.token_issuer || "N/A"}
+                                          </p>
+                                          <p className="mt-1 text-sm text-zinc-400">
+                                            Min Tokens:{" "}
+                                            {req.min_token_amount || 1}
+                                          </p>
+                                        </>
                                       ) : (
-                                        <p className="mt-1 text-sm text-zinc-400">
-                                          Min NFTs: {req.min_nft_count || 1}
-                                        </p>
+                                        <>
+                                          <p className="mt-2 text-sm text-zinc-300">
+                                            {collectionLabel(
+                                              req.issuer,
+                                              req.taxon,
+                                            )}
+                                          </p>
+
+                                          {req.requirement_type === "trait" ? (
+                                            <p className="mt-1 text-sm text-zinc-400">
+                                              {req.trait_type}:{" "}
+                                              {req.trait_value}
+                                            </p>
+                                          ) : (
+                                            <p className="mt-1 text-sm text-zinc-400">
+                                              Min NFTs:{" "}
+                                              {req.min_nft_count || 1}
+                                            </p>
+                                          )}
+                                        </>
                                       )}
                                     </div>
                                   ))}
@@ -2013,101 +2192,160 @@ export default function ProjectPage({
                                       NFT Quantity
                                     </option>
                                     <option value="trait">NFT Trait</option>
+                                    <option value="token_quantity">
+                                      Token Quantity
+                                    </option>
                                   </select>
 
-                                  <select
-                                    value={`${req.issuer}|${req.taxon}`}
-                                    onChange={(e) => {
-                                      const [issuer, taxon] =
-                                        e.target.value.split("|");
-                                      updateRequirement(
-                                        groupIndex,
-                                        requirementIndex,
-                                        "issuer",
-                                        issuer || "",
-                                      );
-                                      updateRequirement(
-                                        groupIndex,
-                                        requirementIndex,
-                                        "taxon",
-                                        taxon || "",
-                                      );
-                                    }}
-                                    className="mt-4 w-full rounded-2xl border border-zinc-700 bg-black/60 px-5 py-4 text-base font-bold text-white outline-none"
-                                  >
-                                    <option value="|">Select Collection</option>
-                                    {sortedCollections.map((collection) => (
-                                      <option
-                                        key={collection.id}
-                                        value={`${collection.issuer}|${collection.taxon}`}
-                                      >
-                                        {collection.name ||
-                                          `Taxon ${collection.taxon}`}
-                                      </option>
-                                    ))}
-                                  </select>
-
-                                  <input
-                                    value={req.min_nft_count}
-                                    onChange={(e) =>
-                                      updateRequirement(
-                                        groupIndex,
-                                        requirementIndex,
-                                        "min_nft_count",
-                                        e.target.value,
-                                      )
-                                    }
-                                    placeholder="Minimum NFTs Owned"
-                                    className="mt-4 w-full rounded-2xl border border-zinc-700 bg-black/60 px-5 py-4 text-base font-bold text-white outline-none"
-                                  />
-
-                                  {req.requirement_type === "trait" && (
+                                  {req.requirement_type !==
+                                    "token_quantity" && (
                                     <>
                                       <select
-                                        value={req.trait_type}
-                                        onChange={(e) =>
+                                        value={`${req.issuer}|${req.taxon}`}
+                                        onChange={(e) => {
+                                          const [issuer, taxon] =
+                                            e.target.value.split("|");
                                           updateRequirement(
                                             groupIndex,
                                             requirementIndex,
-                                            "trait_type",
-                                            e.target.value,
-                                          )
-                                        }
-                                        className="mt-4 w-full rounded-2xl border border-zinc-700 bg-black/60 px-5 py-4 text-base font-bold text-white outline-none"
-                                      >
-                                        <option value="">
-                                          Select Trait Type
-                                        </option>
-                                        {traitTypes.map((type) => (
-                                          <option key={type} value={type}>
-                                            {type}
-                                          </option>
-                                        ))}
-                                      </select>
-
-                                      <select
-                                        value={req.trait_value}
-                                        onChange={(e) =>
+                                            "issuer",
+                                            issuer || "",
+                                          );
                                           updateRequirement(
                                             groupIndex,
                                             requirementIndex,
-                                            "trait_value",
-                                            e.target.value,
-                                          )
-                                        }
+                                            "taxon",
+                                            taxon || "",
+                                          );
+                                        }}
                                         className="mt-4 w-full rounded-2xl border border-zinc-700 bg-black/60 px-5 py-4 text-base font-bold text-white outline-none"
                                       >
-                                        <option value="">
-                                          Select Trait Value
+                                        <option value="|">
+                                          Select Collection
                                         </option>
-                                        {getTraitValues(req.trait_type).map(
-                                          (value) => (
-                                            <option key={value} value={value}>
-                                              {value}
+                                        {sortedCollections.map(
+                                          (collection) => (
+                                            <option
+                                              key={collection.id}
+                                              value={`${collection.issuer}|${collection.taxon}`}
+                                            >
+                                              {collection.name ||
+                                                `Taxon ${collection.taxon}`}
                                             </option>
                                           ),
                                         )}
                                       </select>
+
+                                      <input
+                                        value={req.min_nft_count}
+                                        onChange={(e) =>
+                                          updateRequirement(
+                                            groupIndex,
+                                            requirementIndex,
+                                            "min_nft_count",
+                                            e.target.value,
+                                          )
+                                        }
+                                        placeholder="Minimum NFTs Owned"
+                                        className="mt-4 w-full rounded-2xl border border-zinc-700 bg-black/60 px-5 py-4 text-base font-bold text-white outline-none"
+                                      />
+
+                                      {req.requirement_type === "trait" && (
+                                        <>
+                                          <select
+                                            value={req.trait_type}
+                                            onChange={(e) =>
+                                              updateRequirement(
+                                                groupIndex,
+                                                requirementIndex,
+                                                "trait_type",
+                                                e.target.value,
+                                              )
+                                            }
+                                            className="mt-4 w-full rounded-2xl border border-zinc-700 bg-black/60 px-5 py-4 text-base font-bold text-white outline-none"
+                                          >
+                                            <option value="">
+                                              Select Trait Type
+                                            </option>
+                                            {traitTypes.map((type) => (
+                                              <option key={type} value={type}>
+                                                {type}
+                                              </option>
+                                            ))}
+                                          </select>
+
+                                          <select
+                                            value={req.trait_value}
+                                            onChange={(e) =>
+                                              updateRequirement(
+                                                groupIndex,
+                                                requirementIndex,
+                                                "trait_value",
+                                                e.target.value,
+                                              )
+                                            }
+                                            className="mt-4 w-full rounded-2xl border border-zinc-700 bg-black/60 px-5 py-4 text-base font-bold text-white outline-none"
+                                          >
+                                            <option value="">
+                                              Select Trait Value
+                                            </option>
+                                            {getTraitValues(
+                                              req.trait_type,
+                                            ).map((value) => (
+                                              <option key={value} value={value}>
+                                                {value}
+                                              </option>
+                                            ))}
+                                          </select>
+                                        </>
+                                      )}
+                                    </>
+                                  )}
+
+                                  {req.requirement_type ===
+                                    "token_quantity" && (
+                                    <>
+                                      <input
+                                        value={req.token_currency}
+                                        onChange={(e) =>
+                                          updateRequirement(
+                                            groupIndex,
+                                            requirementIndex,
+                                            "token_currency",
+                                            e.target.value,
+                                          )
+                                        }
+                                        placeholder="Token Currency (example: CAC, FUZZY, USD)"
+                                        className="mt-4 w-full rounded-2xl border border-zinc-700 bg-black/60 px-5 py-4 text-base font-bold text-white outline-none"
+                                      />
+
+                                      <input
+                                        value={req.token_issuer}
+                                        onChange={(e) =>
+                                          updateRequirement(
+                                            groupIndex,
+                                            requirementIndex,
+                                            "token_issuer",
+                                            e.target.value,
+                                          )
+                                        }
+                                        placeholder="Token Issuer Wallet"
+                                        className="mt-4 w-full rounded-2xl border border-zinc-700 bg-black/60 px-5 py-4 text-base font-bold text-white outline-none"
+                                      />
+
+                                      <input
+                                        value={req.min_token_amount}
+                                        onChange={(e) =>
+                                          updateRequirement(
+                                            groupIndex,
+                                            requirementIndex,
+                                            "min_token_amount",
+                                            e.target.value,
+                                          )
+                                        }
+                                        placeholder="Minimum Tokens Owned"
+                                        className="mt-4 w-full rounded-2xl border border-zinc-700 bg-black/60 px-5 py-4 text-base font-bold text-white outline-none"
+                                      />
                                     </>
                                   )}
                                 </div>
@@ -2144,21 +2382,9 @@ export default function ProjectPage({
           </div>
         </section>
 
-        <footer className="mt-8 flex flex-wrap items-center justify-center gap-4 rounded-3xl border border-[#3a2b16] bg-[#15110c] p-5">
-          {SOCIALS.map((social) => (
-            <a
-              key={social.name}
-              href={social.href}
-              target="_blank"
-              rel="noreferrer"
-              className="flex items-center gap-2 rounded-full border border-zinc-700 bg-black/50 px-4 py-2 text-xs font-black uppercase text-zinc-300 hover:border-cyan-400 hover:text-cyan-400"
-            >
-              <img src={social.icon} alt={social.name} className="h-5 w-5" />
-              {social.name}
-            </a>
-          ))}
-        </footer>
       </div>
+
+      <CockyFooter />
 
       <div className="fixed bottom-5 right-5 z-40 w-64 rounded-3xl border border-yellow-400/50 bg-[#15110c]/95 p-4 shadow-[0_0_35px_rgba(250,204,21,0.22)] backdrop-blur">
         <div className="flex items-center justify-between">
@@ -2203,6 +2429,8 @@ export default function ProjectPage({
           Next Track
         </button>
       </div>
+        </>
+      )}
     </main>
   );
 }

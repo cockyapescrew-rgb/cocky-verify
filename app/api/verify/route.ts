@@ -25,6 +25,19 @@ type Trait = {
   value: string;
 };
 
+type TokenBalance = {
+  currency: string;
+  issuer: string;
+  balance: number;
+};
+
+type GatedCollection = {
+  issuer: string;
+  taxon: string;
+  key: string;
+  name: string;
+};
+
 type RequirementResult = {
   requirement_type: string;
   issuer: string;
@@ -36,13 +49,18 @@ type RequirementResult = {
   trait_type?: string;
   trait_value?: string;
   matching_trait_count?: number;
+
+  token_currency?: string;
+  token_issuer?: string;
+  token_balance?: number;
+  required_token_amount?: number;
 };
 
 type RuleResult = {
   role_id: string;
   role_name: string;
   passed: boolean;
-  logic: "OR";
+  logic: "OR" | "OR_GROUPS_AND_INSIDE";
   requirements: RequirementResult[];
 };
 
@@ -56,6 +74,60 @@ type CollectionSummary = {
 
 function normalize(value: any) {
   return String(value || "").trim().toLowerCase();
+}
+
+function collectionKey(issuer: any, taxon: any) {
+  return `${normalize(issuer)}|${String(taxon || "").trim()}`;
+}
+
+function decodeHexCurrency(value: string) {
+  const clean = String(value || "").trim();
+
+  if (!/^[A-Fa-f0-9]{40}$/.test(clean)) {
+    return clean;
+  }
+
+  try {
+    const decoded = Buffer.from(clean, "hex")
+      .toString("utf8")
+      .replace(/\0/g, "")
+      .trim();
+
+    return decoded || clean;
+  } catch {
+    return clean;
+  }
+}
+
+function normalizeCurrency(value: any) {
+  const raw = String(value || "").trim();
+  const decoded = decodeHexCurrency(raw);
+
+  return decoded.toUpperCase();
+}
+
+function isTokenRequirementType(requirementType: string) {
+  return ["token_count", "token_quantity", "token"].includes(requirementType);
+}
+
+function tokenKey(currency: any, issuer: any) {
+  return `${normalizeCurrency(currency)}|${normalize(issuer)}`;
+}
+
+function isProjectBillingActive(project: any) {
+  if (project?.admin_locked) return false;
+
+  if (project?.billing_status === "comped") return true;
+
+  if (project?.billing_status !== "active") return false;
+
+  if (!project?.paid_until) return false;
+
+  const paidUntil = new Date(project.paid_until).getTime();
+
+  if (Number.isNaN(paidUntil)) return false;
+
+  return paidUntil > Date.now();
 }
 
 function chunkArray<T>(items: T[], size: number): T[][] {
@@ -176,6 +248,165 @@ async function fetchWalletNfts(wallet: string): Promise<OwnedNft[]> {
   return owned;
 }
 
+
+async function fetchWalletTokenBalances(wallet: string): Promise<TokenBalance[]> {
+  const balances: TokenBalance[] = [];
+  let marker: any = undefined;
+
+  for (let i = 0; i < 10; i++) {
+    const res = await fetchWithTimeout(
+      XRPL_RPC,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          method: "account_lines",
+          params: [
+            {
+              account: wallet,
+              limit: 400,
+              marker,
+            },
+          ],
+        }),
+        cache: "no-store",
+      },
+      XRPL_FETCH_TIMEOUT_MS
+    );
+
+    const data = await res.json();
+
+    if (!res.ok || data?.result?.error) {
+      throw new Error(
+        data?.result?.error_message || "Failed to fetch wallet token balances"
+      );
+    }
+
+    const lines = data?.result?.lines || [];
+
+    for (const line of lines) {
+      balances.push({
+        currency: String(line.currency || ""),
+        issuer: String(line.account || ""),
+        balance: Number(line.balance || 0),
+      });
+    }
+
+    marker = data?.result?.marker;
+
+    if (!marker) break;
+  }
+
+  return balances;
+}
+
+async function loadProjectCollectionNames(projectId: string) {
+  const namesByKey = new Map<string, string>();
+
+  try {
+    const { data } = await supabase
+      .from("collections")
+      .select("issuer,taxon,name")
+      .eq("project_id", projectId);
+
+    for (const row of data || []) {
+      const key = collectionKey(row.issuer, row.taxon);
+      const name = String(row.name || "").trim();
+
+      if (key && name) {
+        namesByKey.set(key, name);
+      }
+    }
+  } catch {
+    // If this table/query is unavailable, do not block verification.
+  }
+
+  return namesByKey;
+}
+
+function buildGatedCollectionsFromRules(
+  rules: any[],
+  collectionNamesByKey: Map<string, string>
+) {
+  const gated = new Map<string, GatedCollection>();
+
+  for (const rule of rules || []) {
+    const requirements = rule.role_rule_requirements || [];
+
+    for (const requirement of requirements) {
+      const requirementType = normalize(requirement.requirement_type);
+
+      if (isTokenRequirementType(requirementType)) continue;
+
+      const issuer = String(requirement.issuer || "").trim();
+      const taxon = String(requirement.taxon || "").trim();
+
+      if (!issuer) continue;
+
+      const key = collectionKey(issuer, taxon);
+
+      if (gated.has(key)) continue;
+
+      const name =
+        collectionNamesByKey.get(key) ||
+        String(requirement.collection_name || requirement.name || "").trim() ||
+        (taxon ? `Taxon ${taxon}` : "Any Taxon");
+
+      gated.set(key, {
+        issuer,
+        taxon,
+        key,
+        name,
+      });
+    }
+  }
+
+  return Array.from(gated.values()).sort((a, b) =>
+    a.name.localeCompare(b.name)
+  );
+}
+
+function nftMatchesGatedCollection(nft: OwnedNft, gated: GatedCollection) {
+  const issuerMatches = normalize(nft.issuer) === normalize(gated.issuer);
+  const taxonMatches = !gated.taxon || String(nft.taxon) === String(gated.taxon);
+
+  return issuerMatches && taxonMatches;
+}
+
+function rowMatchesGatedCollection(row: any, gated: GatedCollection) {
+  const rowIssuer = String(row.issuer || row.nft_issuer || "");
+  const rowTaxon = String(row.taxon || row.nft_taxon || "");
+
+  const issuerMatches = normalize(rowIssuer) === normalize(gated.issuer);
+  const taxonMatches = !gated.taxon || String(rowTaxon) === String(gated.taxon);
+
+  return issuerMatches && taxonMatches;
+}
+
+function filterOwnedNftsToGatedCollections(
+  ownedNfts: OwnedNft[],
+  gatedCollections: GatedCollection[]
+) {
+  if (gatedCollections.length === 0) return ownedNfts;
+
+  return ownedNfts.filter((nft) =>
+    gatedCollections.some((gated) => nftMatchesGatedCollection(nft, gated))
+  );
+}
+
+function filterSavedRowsToGatedCollections(
+  savedRows: any[],
+  gatedCollections: GatedCollection[]
+) {
+  if (gatedCollections.length === 0) return savedRows;
+
+  return savedRows.filter((row) =>
+    gatedCollections.some((gated) => rowMatchesGatedCollection(row, gated))
+  );
+}
+
 function countMatchingCollectionNfts(requirement: any, ownedNfts: OwnedNft[]) {
   const issuer = normalize(requirement.issuer);
   const taxon = String(requirement.taxon || "").trim();
@@ -188,15 +419,30 @@ function countMatchingCollectionNfts(requirement: any, ownedNfts: OwnedNft[]) {
   });
 }
 
-function evaluateRequirement(requirement: any, ownedNfts: OwnedNft[]): RequirementResult {
+function evaluateRequirement(
+  requirement: any,
+  ownedNfts: OwnedNft[],
+  tokenBalances: TokenBalance[],
+  collectionNamesByKey: Map<string, string>
+): RequirementResult {
   const requirementType = normalize(requirement.requirement_type);
-  const matchingCollectionNfts = countMatchingCollectionNfts(requirement, ownedNfts);
+  const matchingCollectionNfts = countMatchingCollectionNfts(
+    requirement,
+    ownedNfts
+  );
+
+  const issuer = String(requirement.issuer || "");
+  const taxon = String(requirement.taxon || "");
+  const key = collectionKey(issuer, taxon);
 
   const resultBase: RequirementResult = {
     requirement_type: String(requirement.requirement_type || ""),
-    issuer: String(requirement.issuer || ""),
-    taxon: String(requirement.taxon || ""),
-    collection_name: String(requirement.collection_name || requirement.name || ""),
+    issuer,
+    taxon,
+    collection_name:
+      collectionNamesByKey.get(key) ||
+      String(requirement.collection_name || requirement.name || "") ||
+      (taxon ? `Taxon ${taxon}` : "Any Taxon"),
     passed: false,
   };
 
@@ -220,8 +466,10 @@ function evaluateRequirement(requirement: any, ownedNfts: OwnedNft[]): Requireme
 
     for (const nft of matchingCollectionNfts) {
       const hasTrait = nft.traits.some((trait) => {
-        const typeMatches = !traitType || normalize(trait.trait_type) === traitType;
-        const valueMatches = !traitValue || normalize(trait.value) === traitValue;
+        const typeMatches =
+          !traitType || normalize(trait.trait_type) === traitType;
+        const valueMatches =
+          !traitValue || normalize(trait.value) === traitValue;
 
         return typeMatches && valueMatches;
       });
@@ -248,8 +496,10 @@ function evaluateRequirement(requirement: any, ownedNfts: OwnedNft[]): Requireme
 
     for (const nft of matchingCollectionNfts) {
       const hasTrait = nft.traits.some((trait) => {
-        const typeMatches = !traitType || normalize(trait.trait_type) === traitType;
-        const valueMatches = !traitValue || normalize(trait.value) === traitValue;
+        const typeMatches =
+          !traitType || normalize(trait.trait_type) === traitType;
+        const valueMatches =
+          !traitValue || normalize(trait.value) === traitValue;
 
         return typeMatches && valueMatches;
       });
@@ -265,6 +515,39 @@ function evaluateRequirement(requirement: any, ownedNfts: OwnedNft[]): Requireme
       matching_trait_count: matchingTraitCount,
       required_count: min,
       found_count: matchingCollectionNfts.length,
+    };
+  }
+
+  if (isTokenRequirementType(requirementType)) {
+    const currency = normalizeCurrency(requirement.token_currency);
+    const issuer = normalize(requirement.token_issuer);
+    const min = Number(requirement.min_token_amount || 0);
+
+    const matchingTokens = tokenBalances.filter((token) => {
+      const currencyMatches =
+        !currency || normalizeCurrency(token.currency) === currency;
+      const issuerMatches =
+        !issuer || normalize(token.issuer) === issuer;
+
+      return currencyMatches && issuerMatches;
+    });
+
+    const balance = matchingTokens.reduce(
+      (sum, token) => sum + Number(token.balance || 0),
+      0
+    );
+
+    return {
+      ...resultBase,
+      issuer: "",
+      taxon: "",
+      collection_name: currency || "Any token from issuer",
+      passed: balance >= min,
+      token_currency: String(requirement.token_currency || ""),
+      token_issuer: String(requirement.token_issuer || ""),
+      token_balance: balance,
+      required_token_amount: min,
+      found_count: matchingTokens.length,
     };
   }
 
@@ -327,15 +610,6 @@ async function loadSavedMetadataForOwnedNfts(
     if (nft.traits.length === 0 && Array.isArray(saved.traits)) {
       nft.traits = extractTraits({ attributes: saved.traits });
     }
-
-    /*
-      IMPORTANT:
-      Do NOT fetch live IPFS/metadata here.
-
-      This route must be fast because it runs when a user clicks
-      "Refresh Discord Roles." Metadata should already be indexed
-      from the dashboard scan tools.
-    */
   }
 
   return {
@@ -344,45 +618,76 @@ async function loadSavedMetadataForOwnedNfts(
   };
 }
 
-function buildCollectionSummary(ownedNfts: OwnedNft[], savedRows: any[]) {
+function buildCollectionSummary(
+  ownedNfts: OwnedNft[],
+  savedRows: any[],
+  gatedCollections: GatedCollection[]
+) {
   const collectionMap = new Map<string, CollectionSummary>();
 
+  for (const gated of gatedCollections) {
+    collectionMap.set(gated.key, {
+      issuer: gated.issuer,
+      taxon: gated.taxon,
+      name: gated.name,
+      owned_count: 0,
+      indexed_count: 0,
+    });
+  }
+
   for (const nft of ownedNfts) {
-    const key = `${normalize(nft.issuer)}|${String(nft.taxon)}`;
+    const matchingGated = gatedCollections.find((gated) =>
+      nftMatchesGatedCollection(nft, gated)
+    );
+
+    const key = matchingGated?.key || collectionKey(nft.issuer, nft.taxon);
 
     const existing =
       collectionMap.get(key) ||
       ({
         issuer: nft.issuer,
         taxon: nft.taxon,
-        name: `Taxon ${nft.taxon}`,
+        name: matchingGated?.name || `Taxon ${nft.taxon}`,
         owned_count: 0,
         indexed_count: 0,
       } satisfies CollectionSummary);
 
     existing.owned_count += 1;
-
     collectionMap.set(key, existing);
   }
 
   for (const row of savedRows) {
-    const issuer = String(row.issuer || row.nft_issuer || "");
-    const taxon = String(row.taxon || row.nft_taxon || "");
-    const key = `${normalize(issuer)}|${taxon}`;
+    const matchingGated = gatedCollections.find((gated) =>
+      rowMatchesGatedCollection(row, gated)
+    );
+
+    const issuer = String(
+      row.issuer || row.nft_issuer || matchingGated?.issuer || ""
+    );
+    const taxon = String(
+      row.taxon || row.nft_taxon || matchingGated?.taxon || ""
+    );
+    const key = matchingGated?.key || collectionKey(issuer, taxon);
 
     const existing =
       collectionMap.get(key) ||
       ({
         issuer,
         taxon,
-        name: row.collection_name || row.name || `Taxon ${taxon || "Unknown"}`,
+        name:
+          matchingGated?.name ||
+          row.collection_name ||
+          row.name ||
+          `Taxon ${taxon || "Unknown"}`,
         owned_count: 0,
         indexed_count: 0,
       } satisfies CollectionSummary);
 
     existing.indexed_count += 1;
 
-    if (row.collection_name || row.name) {
+    if (matchingGated?.name) {
+      existing.name = matchingGated.name;
+    } else if (row.collection_name || row.name) {
       existing.name = row.collection_name || row.name;
     }
 
@@ -395,7 +700,10 @@ function buildCollectionSummary(ownedNfts: OwnedNft[], savedRows: any[]) {
 }
 
 function buildTraitSummary(ownedNfts: OwnedNft[]) {
-  const traitMap = new Map<string, { trait_type: string; value: string; count: number }>();
+  const traitMap = new Map<
+    string,
+    { trait_type: string; value: string; count: number }
+  >();
 
   for (const nft of ownedNfts) {
     for (const trait of nft.traits) {
@@ -569,6 +877,27 @@ export async function POST(req: Request) {
       );
     }
 
+    if (!isProjectBillingActive(project)) {
+      return NextResponse.json(
+        {
+          success: false,
+          verified: false,
+          billing_locked: true,
+          error:
+            "This Discord server's Cocky Portal subscription is inactive. Ask the server manager to renew hosting from the dashboard.",
+          scan_summary: {
+            project_id: project.id,
+            project_name: project.name,
+            discord_guild_id: discordGuildId,
+            billing_status: project.billing_status || "inactive",
+            paid_until: project.paid_until || null,
+            admin_locked: Boolean(project.admin_locked),
+          },
+        },
+        { status: 402 }
+      );
+    }
+
     console.time("loadRules");
 
     const { data: rules, error: rulesError } = await supabase
@@ -600,24 +929,57 @@ export async function POST(req: Request) {
       );
     }
 
+    const collectionNamesByKey = await loadProjectCollectionNames(project.id);
+    const gatedCollections = buildGatedCollectionsFromRules(
+      rules,
+      collectionNamesByKey
+    );
+
+    console.log("GATED COLLECTIONS", gatedCollections);
+
     console.time("fetchWalletNfts");
 
-    let ownedNfts = await fetchWalletNfts(wallet);
+    const allOwnedNfts = await fetchWalletNfts(wallet);
 
     console.timeEnd("fetchWalletNfts");
-    console.log("OWNED NFT COUNT", ownedNfts.length);
+    console.log("OWNED NFT COUNT", allOwnedNfts.length);
+
+    console.time("fetchWalletTokenBalances");
+
+    const tokenBalances = await fetchWalletTokenBalances(wallet);
+
+    console.timeEnd("fetchWalletTokenBalances");
+    console.log("TOKEN BALANCE COUNT", tokenBalances.length);
+
+    let ownedNfts = filterOwnedNftsToGatedCollections(
+      allOwnedNfts,
+      gatedCollections
+    );
+
+    console.log("GATED OWNED NFT COUNT", ownedNfts.length);
 
     console.time("loadSavedMetadataForOwnedNfts");
 
-    const metadataResult = await loadSavedMetadataForOwnedNfts(project.id, ownedNfts);
+    const metadataResult = await loadSavedMetadataForOwnedNfts(
+      project.id,
+      ownedNfts
+    );
+
     ownedNfts = metadataResult.ownedNfts;
+
+    const gatedSavedRows = filterSavedRowsToGatedCollections(
+      metadataResult.savedRows,
+      gatedCollections
+    );
 
     console.timeEnd("loadSavedMetadataForOwnedNfts");
 
     const collectionSummary = buildCollectionSummary(
       ownedNfts,
-      metadataResult.savedRows
+      gatedSavedRows,
+      gatedCollections
     );
+
     const traitSummary = buildTraitSummary(ownedNfts);
 
     const rolesToAdd = new Set<string>();
@@ -636,23 +998,42 @@ export async function POST(req: Request) {
       if (!roleId) continue;
 
       const requirementResults = requirements.map((requirement: any) =>
-        evaluateRequirement(requirement, ownedNfts)
+        evaluateRequirement(
+          requirement,
+          ownedNfts,
+          tokenBalances,
+          collectionNamesByKey
+        )
       );
 
-      // IMPORTANT:
-      // Role rules are treated as OR.
-      // If the wallet passes any requirement, it gets the role.
+      const groups = new Map<number, RequirementResult[]>();
+
+      requirementResults.forEach((result: RequirementResult, index: number) => {
+        const sourceRequirement = requirements[index] || {};
+        const groupId = Number(sourceRequirement.group_id || index + 1);
+
+        if (!groups.has(groupId)) {
+          groups.set(groupId, []);
+        }
+
+        groups.get(groupId)!.push(result);
+      });
+
       const passes =
         requirementResults.length > 0 &&
-        requirementResults.some(
-          (requirement: RequirementResult) => requirement.passed
+        Array.from(groups.values()).some(
+          (groupRequirements) =>
+            groupRequirements.length > 0 &&
+            groupRequirements.every(
+              (requirement: RequirementResult) => requirement.passed
+            )
         );
 
       ruleResults.push({
         role_id: roleId,
         role_name: roleName,
         passed: passes,
-        logic: "OR",
+        logic: "OR_GROUPS_AND_INSIDE",
         requirements: requirementResults,
       });
 
@@ -693,10 +1074,17 @@ export async function POST(req: Request) {
       discord_guild_id: discordGuildId,
       project_id: project.id,
       project_name: project.name,
+
+      wallet_total_nfts_owned: allOwnedNfts.length,
       total_nfts_owned: ownedNfts.length,
-      indexed_nfts_found: metadataResult.savedRows.length,
+      indexed_nfts_found: gatedSavedRows.length,
+
+      gated_collections_count: gatedCollections.length,
+      gated_collections: gatedCollections,
+
       collections: collectionSummary,
       traits: traitSummary,
+      tokens: tokenBalances,
       rules: ruleResults,
     };
 

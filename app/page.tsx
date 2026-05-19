@@ -1,6 +1,8 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import CockyHeader from "@/app/components/CockyHeader";
+import CockyFooter from "@/app/components/CockyFooter";
 
 type WalletProvider = "xaman" | "joey" | "";
 type VerifyState = "idle" | "checking" | "success" | "error" | "missing-discord";
@@ -18,6 +20,8 @@ type DiscordGuild = {
   icon?: string | null;
   owner?: boolean;
   permissions?: string;
+  project_id?: string;
+  project_name?: string;
 };
 
 type ScanSummary = {
@@ -26,6 +30,7 @@ type ScanSummary = {
   discord_guild_id?: string;
   project_id?: string;
   project_name?: string;
+  wallet_total_nfts_owned?: number;
   total_nfts_owned?: number;
   indexed_nfts_found?: number;
   collections?: {
@@ -80,6 +85,8 @@ export default function Home() {
   const [selectedGuildId, setSelectedGuildId] = useState("");
   const [discordLoading, setDiscordLoading] = useState(false);
   const [scanSummary, setScanSummary] = useState<ScanSummary | null>(null);
+  const [urlGuildId, setUrlGuildId] = useState("");
+  const [urlDiscordId, setUrlDiscordId] = useState("");
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -96,6 +103,9 @@ export default function Home() {
       params.get("discord_id") ||
       params.get("discordId") ||
       "";
+
+    setUrlGuildId(guildFromUrl);
+    setUrlDiscordId(userFromUrl);
 
     if (guildFromUrl) {
       setSelectedGuildId(guildFromUrl);
@@ -151,6 +161,11 @@ export default function Home() {
     };
   }
 
+  function hasDiscordCommandContext() {
+    const { guildId, userId } = getDiscordContext();
+    return Boolean(guildId && userId && (urlGuildId || urlDiscordId));
+  }
+
   async function loadDiscordSession() {
     try {
       setDiscordLoading(true);
@@ -164,7 +179,7 @@ export default function Home() {
         setDiscordUser(meData.user);
         localStorage.setItem(DISCORD_USER_KEY, meData.user.id);
 
-        const guildRes = await fetch("/api/discord/guilds", {
+        const guildRes = await fetch("/api/discord/verify-guilds", {
           cache: "no-store",
         });
         const guildData = await guildRes.json().catch(() => ({}));
@@ -174,14 +189,14 @@ export default function Home() {
           const sortedGuilds = loadedGuilds
             .filter((guild: DiscordGuild) => guild?.id && guild?.name)
             .sort((a: DiscordGuild, b: DiscordGuild) =>
-              a.name.localeCompare(b.name)
+              a.name.localeCompare(b.name),
             );
 
           setGuilds(sortedGuilds);
 
           const savedGuildId = localStorage.getItem(DISCORD_GUILD_KEY) || "";
           const hasSavedGuild = sortedGuilds.some(
-            (guild: DiscordGuild) => guild.id === savedGuildId
+            (guild: DiscordGuild) => guild.id === savedGuildId,
           );
 
           if (!selectedGuildId && hasSavedGuild) {
@@ -199,7 +214,7 @@ export default function Home() {
   function connectDiscord() {
     const returnTo =
       typeof window !== "undefined"
-        ? encodeURIComponent(window.location.href)
+        ? encodeURIComponent(`${window.location.pathname}${window.location.search || ""}`)
         : "";
 
     window.location.href = returnTo
@@ -249,7 +264,7 @@ export default function Home() {
     if (!guildId || !userId) {
       setVerifyState("missing-discord");
       setVerifyMessage(
-        "Wallet connected. Connect Discord and select a server, or open this page from /verifyportal inside Discord."
+        "Wallet connected. Connect Discord and select a configured server, or open this page from /verifyportal inside Discord.",
       );
       return;
     }
@@ -281,20 +296,20 @@ export default function Home() {
         setVerifyState("error");
         setVerifyMessage(
           data.error ||
-            "Wallet connected, but the Discord role update route is not finished yet."
+            "Wallet connected, but the Discord role update route is not finished yet.",
         );
         return;
       }
 
       setVerifyState("success");
       setVerifyMessage(
-        data.message || "Verification complete. Discord roles updated."
+        data.message || "Verification complete. Discord roles updated.",
       );
     } catch (err) {
       console.error(err);
       setVerifyState("error");
       setVerifyMessage(
-        "Wallet connected, but /api/verify is missing or failed. The next step is wiring the role-update route."
+        "Wallet connected, but /api/verify is missing or failed. The next step is wiring the role-update route.",
       );
     }
   }
@@ -429,81 +444,32 @@ export default function Home() {
       setLoading(false);
       setVerifyState("error");
       setVerifyMessage(
-        "Joey WalletConnect could not finish. Make sure Joey supports this WalletConnect XRPL request and try again."
+        "Joey WalletConnect could not finish. Make sure Joey supports this WalletConnect XRPL request and try again.",
       );
     }
   }
 
   return (
-    <main className="min-h-screen bg-[#071310] px-5 py-6 text-[#fff4d8]">
-      <div className="mx-auto max-w-6xl">
-        <header className="mb-6 flex items-center justify-between rounded-3xl border border-[#3a2b16] bg-[#15110c]/90 px-6 py-4 shadow-2xl">
-          <div className="flex items-center gap-4">
-            <div className="flex h-16 w-16 items-center justify-center overflow-hidden rounded-full border border-yellow-400 bg-black">
-              <img src="/cblogo.png" alt="Cocky Portal" className="h-full w-full object-cover" />
-            </div>
+    <main className="min-h-screen bg-[#071310] text-[#fff4d8]">
+      <CockyHeader
+        mode="verify"
+        discordName={discordUser ? discordUser.global_name || discordUser.username || "" : ""}
+        showDiscordLogin={!discordUser && !hasDiscordCommandContext()}
+      />
 
-            <div>
-              <h1 className="text-3xl font-black leading-none">
-                <span className="text-yellow-400">CAL</span>
-                <span className="text-cyan-400">Co</span>{" "}
-                <span className="text-white">Verify</span>
-              </h1>
-              <p className="mt-1 text-sm text-zinc-400">
-                Official XRPL Discord access portal
-              </p>
-            </div>
-          </div>
-
-          <div className="flex flex-wrap items-center justify-end gap-3">
-            {discordUser ? (
-              <div className="rounded-full border border-cyan-500/40 bg-cyan-500/10 px-4 py-2">
-                <p className="text-[10px] font-black uppercase tracking-[0.25em] text-cyan-300">
-                  Discord Connected
-                </p>
-                <p className="text-xs font-bold text-white">
-                  {discordUser.global_name || discordUser.username || "Discord User"}
-                </p>
-              </div>
-            ) : (
-              <button
-                onClick={connectDiscord}
-                disabled={discordLoading}
-                className="rounded-full border border-cyan-500 bg-cyan-500/10 px-5 py-3 text-xs font-black uppercase text-cyan-300 hover:bg-cyan-500/20 disabled:opacity-60"
-              >
-                {discordLoading ? "Checking Discord..." : "Connect Discord"}
-              </button>
-            )}
-
-          {wallet ? (
-            <div className="flex items-center gap-3 rounded-full border border-emerald-500/50 bg-emerald-500/10 px-4 py-2">
-              <div>
-                <p className="text-[10px] font-black uppercase tracking-[0.25em] text-emerald-400">
-                  {walletProvider === "joey" ? "Joey Connected" : "Xaman Connected"}
-                </p>
-                <p className="text-xs font-bold text-white">{shortWallet(wallet)}</p>
-              </div>
-
-              <button
-                onClick={disconnectWallet}
-                className="rounded-full bg-red-900/70 px-3 py-1 text-[10px] font-black uppercase text-white hover:bg-red-700"
-              >
-                Disconnect
-              </button>
-            </div>
-          ) : (
-            <button
-              onClick={() => setWalletModal(true)}
-              disabled={loading}
-              className="rounded-full bg-emerald-500 px-6 py-3 text-sm font-black text-white shadow-lg shadow-emerald-500/20 hover:bg-emerald-400 disabled:opacity-60"
-            >
-              {loading ? "Waiting..." : "Connect Wallet"}
-            </button>
-          )}
-          </div>
-        </header>
-
+      <div className="mx-auto max-w-6xl px-5 py-6">
         <section className="relative overflow-hidden rounded-3xl border border-[#3a2b16] bg-black px-7 py-12 shadow-2xl">
+          <video
+            className="absolute inset-0 h-full w-full object-cover opacity-35"
+            autoPlay
+            muted
+            loop
+            playsInline
+          >
+            <source src="/herobot.MP4" type="video/mp4" />
+          </video>
+
+          <div className="absolute inset-0 bg-gradient-to-r from-black via-black/80 to-black/35" />
           <div className="absolute inset-0 bg-[radial-gradient(circle_at_70%_20%,rgba(34,211,238,0.18),transparent_35%),radial-gradient(circle_at_20%_80%,rgba(250,204,21,0.13),transparent_35%)]" />
           <div className="absolute inset-0 bg-black/45" />
 
@@ -534,59 +500,92 @@ export default function Home() {
             <h3 className="text-2xl font-black text-white">Discord Verification</h3>
 
             <p className="mt-2 text-sm text-zinc-400">
-              Connect Discord, select the server, then connect your XRPL wallet.
-              You can also open this page through /verifyportal and it will auto-fill the server.
+              Open this page through /verifyportal for automatic Discord server
+              detection. If you came here directly, connect Discord and select a
+              configured Cocky Bot server.
             </p>
 
             <div className="mt-6 rounded-2xl border border-cyan-500/30 bg-cyan-500/10 p-5">
-              <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+              {hasDiscordCommandContext() ? (
                 <div>
                   <p className="text-xs font-black uppercase tracking-[0.25em] text-cyan-300">
-                    Discord
+                    Discord Command Detected
                   </p>
+
                   <p className="mt-1 text-sm font-bold text-white">
-                    {discordUser
-                      ? discordUser.global_name || discordUser.username || "Connected"
-                      : "Not connected"}
+                    Server was filled from /verifyportal
+                  </p>
+
+                  <p className="mt-2 break-all text-xs text-zinc-500">
+                    Server ID: {getDiscordContext().guildId}
+                  </p>
+
+                  <p className="mt-1 break-all text-xs text-zinc-500">
+                    Discord User ID: {getDiscordContext().userId}
+                  </p>
+
+                  <p className="mt-3 text-xs text-zinc-400">
+                    Discord Connect is optional when you open this page from the bot command.
                   </p>
                 </div>
+              ) : (
+                <>
+                  <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+                    <div>
+                      <p className="text-xs font-black uppercase tracking-[0.25em] text-cyan-300">
+                        Discord
+                      </p>
+                      <p className="mt-1 text-sm font-bold text-white">
+                        {discordUser
+                          ? discordUser.global_name || discordUser.username || "Connected"
+                          : "Optional unless you came directly to this page"}
+                      </p>
+                    </div>
 
-                {!discordUser && (
-                  <button
-                    onClick={connectDiscord}
-                    disabled={discordLoading}
-                    className="rounded-2xl bg-cyan-400 px-5 py-3 text-sm font-black uppercase text-black hover:bg-cyan-300 disabled:opacity-60"
-                  >
-                    {discordLoading ? "Checking..." : "Connect Discord"}
-                  </button>
-                )}
-              </div>
+                    {!discordUser && (
+                      <button
+                        onClick={connectDiscord}
+                        disabled={discordLoading}
+                        className="rounded-2xl bg-cyan-400 px-5 py-3 text-sm font-black uppercase text-black hover:bg-cyan-300 disabled:opacity-60"
+                      >
+                        {discordLoading ? "Checking..." : "Connect Discord"}
+                      </button>
+                    )}
+                  </div>
 
-              {discordUser && (
-                <div className="mt-4">
-                  <label className="text-xs font-black uppercase tracking-[0.2em] text-zinc-400">
-                    Server To Verify
-                  </label>
+                  {discordUser && (
+                    <div className="mt-4">
+                      <label className="text-xs font-black uppercase tracking-[0.2em] text-zinc-400">
+                        Server To Verify
+                      </label>
 
-                  <select
-                    value={selectedGuildId}
-                    onChange={(e) => handleServerSelect(e.target.value)}
-                    className="mt-2 w-full rounded-2xl border border-zinc-700 bg-black/70 px-4 py-3 text-sm font-bold text-white outline-none"
-                  >
-                    <option value="">Select Discord Server</option>
-                    {guilds.map((guild) => (
-                      <option key={guild.id} value={guild.id}>
-                        {guild.name}
-                      </option>
-                    ))}
-                  </select>
+                      <select
+                        value={selectedGuildId}
+                        onChange={(e) => handleServerSelect(e.target.value)}
+                        className="mt-2 w-full rounded-2xl border border-zinc-700 bg-black/70 px-4 py-3 text-sm font-bold text-white outline-none"
+                      >
+                        <option value="">Select Discord Server</option>
+                        {guilds.map((guild) => (
+                          <option key={guild.id} value={guild.id}>
+                            {guild.project_name || guild.name}
+                          </option>
+                        ))}
+                      </select>
 
-                  {selectedGuildId && (
-                    <p className="mt-2 break-all text-xs text-zinc-500">
-                      Server ID: {selectedGuildId}
-                    </p>
+                      {guilds.length === 0 && (
+                        <p className="mt-2 text-xs text-zinc-500">
+                          No configured Cocky Bot servers found for this Discord account.
+                        </p>
+                      )}
+
+                      {selectedGuildId && (
+                        <p className="mt-2 break-all text-xs text-zinc-500">
+                          Server ID: {selectedGuildId}
+                        </p>
+                      )}
+                    </div>
                   )}
-                </div>
+                </>
               )}
             </div>
 
@@ -662,7 +661,9 @@ export default function Home() {
                       NFTs Owned
                     </p>
                     <p className="text-xl font-black text-white">
-                      {scanSummary.total_nfts_owned ?? 0}
+                      {scanSummary.total_nfts_owned ??
+                        scanSummary.wallet_total_nfts_owned ??
+                        0}
                     </p>
                   </div>
                 </div>
@@ -798,7 +799,6 @@ export default function Home() {
                 </div>
               </div>
             )}
-
           </div>
 
           <div className="rounded-3xl border border-[#3a2b16] bg-[#15110c] p-7 shadow-2xl">
@@ -834,11 +834,9 @@ export default function Home() {
             </div>
           </div>
         </section>
-
-        <footer className="py-8 text-center text-xs text-zinc-600">
-          Powered by XRPL • CALCo • Cocky Apes Crew
-        </footer>
       </div>
+
+      <CockyFooter />
 
       {walletModal && !wallet && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 px-4 backdrop-blur-md">

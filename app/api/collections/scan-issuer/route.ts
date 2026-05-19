@@ -1,10 +1,16 @@
 import { NextResponse } from "next/server";
 import { supabaseAdmin as supabase } from "@/lib/supabase";
 
+export const dynamic = "force-dynamic";
+export const maxDuration = 60;
+
 type AnyNft = Record<string, any>;
 
-const MAX_PAGES = 25;
+const MAX_PAGES = 100;
 const PAGE_LIMIT = 100;
+const METADATA_FETCH_TIMEOUT_MS = 6_000;
+const BITHOMP_FETCH_TIMEOUT_MS = 12_000;
+const METADATA_BATCH_SIZE = 10;
 
 function hexToString(value?: string | null) {
   if (!value) return "";
@@ -41,6 +47,71 @@ function normalizeIpfs(uri?: string | null) {
   return clean;
 }
 
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit = {},
+  timeoutMs = 10_000
+) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...init,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function parseMaybeJson(value: any) {
+  if (!value) return null;
+
+  if (typeof value === "object") return value;
+
+  if (typeof value === "string") {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return null;
+    }
+  }
+
+  return null;
+}
+
+function pickEmbeddedMetadata(nft: AnyNft) {
+  const candidates = [
+    nft.metadata,
+    nft.meta,
+    nft.nftokenMetadata,
+    nft.nftoken_metadata,
+    nft.decodedMetadata,
+    nft.decoded_metadata,
+    nft.json,
+    nft.metadataJson,
+    nft.metadata_json,
+    nft.metaJson,
+    nft.meta_json,
+    nft.data?.metadata,
+    nft.data?.meta,
+    nft.result?.metadata,
+    nft.token?.metadata,
+    nft.nft?.metadata,
+  ];
+
+  for (const candidate of candidates) {
+    const parsed = parseMaybeJson(candidate);
+
+    if (parsed && typeof parsed === "object") {
+      return parsed;
+    }
+  }
+
+  return null;
+}
+
 function getNftId(nft: AnyNft) {
   return (
     nft.nftokenID ||
@@ -50,6 +121,8 @@ function getNftId(nft: AnyNft) {
     nft.token_id ||
     nft.tokenId ||
     nft.id ||
+    nft.nftoken_id ||
+    nft.NFTokenId ||
     ""
   );
 }
@@ -65,6 +138,7 @@ function getTaxon(nft: AnyNft) {
     nft.ledgerData?.taxon ??
     nft.ledger?.taxon ??
     nft.token?.taxon ??
+    nft.nft?.taxon ??
     "0";
 
   return String(raw);
@@ -80,6 +154,7 @@ function getIssuer(nft: AnyNft, fallbackIssuer: string) {
     nft.ledgerData?.issuer ||
     nft.ledger?.issuer ||
     nft.token?.issuer ||
+    nft.nft?.issuer ||
     fallbackIssuer
   );
 }
@@ -98,6 +173,7 @@ function getUri(nft: AnyNft) {
     nft.ledgerData?.uri ||
     nft.ledger?.uri ||
     nft.token?.uri ||
+    nft.nft?.uri ||
     ""
   );
 }
@@ -134,19 +210,9 @@ function getCollectionNameFromMetadata(metadata: any, taxon: string) {
 }
 
 async function fetchMetadata(nft: AnyNft) {
-  const embedded =
-    nft.metadata ||
-    nft.meta ||
-    nft.nftokenMetadata ||
-    nft.decodedMetadata ||
-    nft.json ||
-    nft.data?.metadata ||
-    nft.token?.metadata ||
-    null;
+  const embedded = pickEmbeddedMetadata(nft);
 
-  if (embedded && typeof embedded === "object") {
-    return embedded;
-  }
+  if (embedded) return embedded;
 
   const uri = normalizeIpfs(getUri(nft));
 
@@ -155,7 +221,16 @@ async function fetchMetadata(nft: AnyNft) {
   }
 
   try {
-    const res = await fetch(uri, { cache: "no-store" });
+    const res = await fetchWithTimeout(
+      uri,
+      {
+        cache: "no-store",
+        headers: {
+          Accept: "application/json",
+        },
+      },
+      METADATA_FETCH_TIMEOUT_MS
+    );
 
     if (!res.ok) {
       console.warn("METADATA FETCH FAILED:", uri, res.status);
@@ -182,7 +257,7 @@ function cleanTraitValue(value: any) {
 function normalizeTrait(trait: any) {
   if (!trait || typeof trait !== "object") return null;
 
-  const traitType =
+  const rawTraitType =
     trait.trait_type ||
     trait.traitType ||
     trait.type ||
@@ -190,17 +265,37 @@ function normalizeTrait(trait: any) {
     trait.key ||
     trait.label ||
     trait.property ||
-    "Trait";
+    "";
 
-  const traitValue = cleanTraitValue(
+  const rawTraitValue =
     trait.value ??
-      trait.trait_value ??
-      trait.traitValue ??
-      trait.val ??
-      trait.display_value ??
-      trait.displayValue ??
-      trait.text
-  );
+    trait.trait_value ??
+    trait.traitValue ??
+    trait.val ??
+    trait.display_value ??
+    trait.displayValue ??
+    trait.text;
+
+  // Handles trait objects like { Eyes: "Laser Red" }
+  if (!rawTraitType && rawTraitValue === undefined) {
+    const entries = Object.entries(trait).filter(([key, value]) => {
+      if (!key || value === null || value === undefined) return false;
+      if (typeof value === "object") return false;
+      return true;
+    });
+
+    if (entries.length === 1) {
+      const [key, value] = entries[0];
+
+      return {
+        trait_type: String(key).trim(),
+        trait_value: cleanTraitValue(value),
+      };
+    }
+  }
+
+  const traitType = rawTraitType || "Trait";
+  const traitValue = cleanTraitValue(rawTraitValue);
 
   if (!traitType || !traitValue) return null;
 
@@ -223,6 +318,8 @@ function extractTraits(metadata: any) {
     metadata.metadata?.traits,
     metadata.nft?.attributes,
     metadata.nft?.traits,
+    metadata.nftoken?.attributes,
+    metadata.nftoken?.traits,
   ];
 
   const traits: { trait_type: string; trait_value: string }[] = [];
@@ -236,28 +333,47 @@ function extractTraits(metadata: any) {
     }
   }
 
-  const objectTraitSources = [
-    metadata.traits,
-    metadata.attributes,
-    metadata.properties?.traits,
-    metadata.properties?.attributes,
-    metadata.metadata?.traits,
-    metadata.metadata?.attributes,
-  ];
+  const ignoredObjectKeys = new Set([
+    "name",
+    "description",
+    "image",
+    "animation_url",
+    "external_url",
+    "collection",
+    "collection_name",
+    "collectionName",
+    "project",
+    "series",
+    "family",
+    "attributes",
+    "traits",
+    "files",
+    "media",
+  ]);
 
-  for (const source of objectTraitSources) {
-    if (source && typeof source === "object" && !Array.isArray(source)) {
-      for (const [key, value] of Object.entries(source)) {
-        const traitValue = cleanTraitValue(value);
-        if (key && traitValue) {
-          traits.push({
-            trait_type: String(key).trim(),
-            trait_value: traitValue,
-          });
-        }
+  function addObjectTraits(source: any) {
+    if (!source || typeof source !== "object" || Array.isArray(source)) return;
+
+    for (const [key, value] of Object.entries(source)) {
+      if (!key || ignoredObjectKeys.has(key)) continue;
+
+      const traitValue = cleanTraitValue(value);
+
+      if (traitValue) {
+        traits.push({
+          trait_type: String(key).trim(),
+          trait_value: traitValue,
+        });
       }
     }
   }
+
+  addObjectTraits(metadata.traits);
+  addObjectTraits(metadata.attributes);
+  addObjectTraits(metadata.properties?.traits);
+  addObjectTraits(metadata.properties?.attributes);
+  addObjectTraits(metadata.metadata?.traits);
+  addObjectTraits(metadata.metadata?.attributes);
 
   const unique = new Map<string, { trait_type: string; trait_value: string }>();
 
@@ -266,7 +382,11 @@ function extractTraits(metadata: any) {
     unique.set(key, trait);
   }
 
-  return Array.from(unique.values());
+  return Array.from(unique.values()).sort((a, b) => {
+    const typeCompare = a.trait_type.localeCompare(b.trait_type);
+    if (typeCompare !== 0) return typeCompare;
+    return a.trait_value.localeCompare(b.trait_value);
+  });
 }
 
 function extractNftsFromBithomp(data: any): AnyNft[] {
@@ -274,62 +394,145 @@ function extractNftsFromBithomp(data: any): AnyNft[] {
   if (Array.isArray(data.nfts)) return data.nfts;
   if (Array.isArray(data.items)) return data.items;
   if (Array.isArray(data.data)) return data.data;
+  if (Array.isArray(data.data?.nfts)) return data.data.nfts;
+  if (Array.isArray(data.data?.items)) return data.data.items;
   if (Array.isArray(data.result?.nfts)) return data.result.nfts;
+  if (Array.isArray(data.result?.items)) return data.result.items;
+  if (Array.isArray(data.result?.data)) return data.result.data;
   if (Array.isArray(data.result)) return data.result;
+  if (Array.isArray(data.nftokens)) return data.nftokens;
+  if (Array.isArray(data.tokens)) return data.tokens;
+
   return [];
 }
 
 async function fetchBithompPage(
   issuer: string,
-  page: number,
   bithompKey: string,
-  requestedTaxon = ""
+  requestedTaxon = "",
+  marker = "",
+  offset = 0
 ) {
-  const taxonParam = requestedTaxon
-    ? `&taxon=${encodeURIComponent(requestedTaxon)}`
-    : "";
+  const params = new URLSearchParams();
 
-  const urls = [
-    `https://bithomp.com/api/v2/nfts?issuer=${issuer}${taxonParam}&limit=${PAGE_LIMIT}&page=${page}`,
-    `https://bithomp.com/api/v2/nfts?issuer=${issuer}${taxonParam}&limit=${PAGE_LIMIT}&offset=${(page - 1) * PAGE_LIMIT}`,
-  ];
+  params.set("issuer", issuer);
+  params.set("limit", String(PAGE_LIMIT));
 
-  for (const url of urls) {
-    const res = await fetch(url, {
+  if (requestedTaxon) {
+    params.set("taxon", requestedTaxon);
+  }
+
+  if (marker) {
+    params.set("marker", marker);
+  } else if (offset > 0) {
+    params.set("offset", String(offset));
+  }
+
+  const url = `https://bithomp.com/api/v2/nfts?${params.toString()}`;
+
+  const res = await fetchWithTimeout(
+    url,
+    {
       headers: {
         "x-bithomp-token": bithompKey,
       },
       cache: "no-store",
-    });
+    },
+    BITHOMP_FETCH_TIMEOUT_MS
+  );
 
-    const data = await res.json();
+  const data = await res.json().catch(() => ({}));
 
-    if (!res.ok) {
-      return {
-        ok: false,
-        status: res.status,
-        data,
-        nfts: [],
-      };
-    }
-
-    const nfts = extractNftsFromBithomp(data);
-
-    if (nfts.length > 0 || page === 1) {
-      return {
-        ok: true,
-        status: res.status,
-        data,
-        nfts,
-      };
-    }
+  if (!res.ok) {
+    return {
+      ok: false,
+      status: res.status,
+      data,
+      nfts: [] as AnyNft[],
+      marker: "",
+      totalNfts: 0,
+    };
   }
+
+  const nfts = extractNftsFromBithomp(data);
+
+  const nextMarker =
+    data.marker ||
+    data.nextMarker ||
+    data.result?.marker ||
+    data.result?.nextMarker ||
+    data.data?.marker ||
+    data.data?.nextMarker ||
+    "";
+
+  const totalNfts = Number(
+    data.summary?.totalNfts ||
+      data.result?.summary?.totalNfts ||
+      data.data?.summary?.totalNfts ||
+      data.totalNfts ||
+      data.total ||
+      0
+  );
 
   return {
     ok: true,
-    status: 200,
-    data: {},
-    nfts: [],
+    status: res.status,
+    data,
+    nfts,
+    marker: String(nextMarker || ""),
+    totalNfts,
+  };
+}
+
+async function processNftForScan({
+  nft,
+  project_id,
+  fallbackIssuer,
+  requestedTaxon,
+  rowIndex,
+}: {
+  nft: AnyNft;
+  project_id: string;
+  fallbackIssuer: string;
+  requestedTaxon: string;
+  rowIndex: number;
+}) {
+  const nftId = getNftId(nft);
+  const detectedIssuer = getIssuer(nft, fallbackIssuer);
+  const taxon = getTaxon(nft);
+
+  if (requestedTaxon && String(taxon) !== requestedTaxon) {
+    return null;
+  }
+
+  const uri = normalizeIpfs(getUri(nft));
+  const metadata = await fetchMetadata(nft);
+  const traits = metadata ? extractTraits(metadata) : [];
+  const collectionName = metadata
+    ? getCollectionNameFromMetadata(metadata, taxon)
+    : `Taxon ${taxon}`;
+
+  const nftRow = {
+    project_id,
+    issuer: detectedIssuer,
+    taxon,
+    nft_id: nftId || `${detectedIssuer}-${taxon}-${rowIndex}`,
+    name: metadata?.name || nft.name || nftId || "Unnamed NFT",
+    image: normalizeIpfs(metadata?.image || nft.image || ""),
+    metadata_uri: uri,
+    traits,
+    updated_at: new Date().toISOString(),
+  };
+
+  return {
+    nftId,
+    detectedIssuer,
+    taxon,
+    uri,
+    metadata,
+    traits,
+    collectionName,
+    nftRow,
   };
 }
 
@@ -362,11 +565,25 @@ export async function POST(req: Request) {
     const seenNfts = new Set<string>();
     let pagesScanned = 0;
     let lastBithompResponse: any = null;
+    let marker = "";
+    let offset = 0;
+    let expectedTotalNfts = 0;
 
     for (let page = 1; page <= MAX_PAGES; page++) {
-      const pageResult = await fetchBithompPage(issuer, page, bithompKey, requestedTaxon);
+      const pageResult = await fetchBithompPage(
+        issuer,
+        bithompKey,
+        requestedTaxon,
+        marker,
+        offset
+      );
+
       pagesScanned = page;
       lastBithompResponse = pageResult.data;
+
+      if (pageResult.totalNfts > 0) {
+        expectedTotalNfts = pageResult.totalNfts;
+      }
 
       if (!pageResult.ok) {
         console.error("BITHOMP ERROR:", pageResult.data);
@@ -398,6 +615,17 @@ export async function POST(req: Request) {
       }
 
       if (pageResult.nfts.length < PAGE_LIMIT) break;
+
+      if (pageResult.marker) {
+        marker = pageResult.marker;
+      } else {
+        offset += PAGE_LIMIT;
+
+        if (expectedTotalNfts > 0 && offset >= expectedTotalNfts) {
+          break;
+        }
+      }
+
       if (newCount === 0) break;
     }
 
@@ -419,62 +647,70 @@ export async function POST(req: Request) {
     let failedMetadata = 0;
     let matchedNfts = 0;
 
-    for (const nft of allNfts) {
-      const nftId = getNftId(nft);
-      const detectedIssuer = getIssuer(nft, issuer);
-      const taxon = getTaxon(nft);
+    let globalRowIndex = 0;
 
-      if (requestedTaxon && String(taxon) !== requestedTaxon) {
-        continue;
-      }
+    for (const batch of chunkNfts(allNfts, METADATA_BATCH_SIZE)) {
+      const processedBatch = await Promise.all(
+        batch.map((nft, index) =>
+          processNftForScan({
+            nft,
+            project_id,
+            fallbackIssuer: issuer,
+            requestedTaxon,
+            rowIndex: globalRowIndex + index,
+          })
+        )
+      );
 
-      matchedNfts++;
+      globalRowIndex += batch.length;
 
-      const uri = normalizeIpfs(getUri(nft));
-      const metadata = await fetchMetadata(nft);
-      const traits = metadata ? extractTraits(metadata) : [];
-      const collectionName = metadata
-        ? getCollectionNameFromMetadata(metadata, taxon)
-        : `Taxon ${taxon}`;
+      for (const processed of processedBatch) {
+        if (!processed) continue;
 
-      if (metadata) metadataFound++;
-      if (!metadata && uri) failedMetadata++;
-      if (traits.length > 0) traitsFound += traits.length;
+        matchedNfts++;
 
-      const collectionKey = `${detectedIssuer}|${taxon}`;
-
-      const existing = collectionMap.get(collectionKey);
-
-      if (existing) {
-        existing.count += 1;
-
-        if (existing.name.startsWith("Taxon ") && !collectionName.startsWith("Taxon ")) {
-          existing.name = collectionName;
-        }
-      } else {
-        collectionMap.set(collectionKey, {
-          issuer: detectedIssuer,
+        const {
+          detectedIssuer,
           taxon,
-          name: collectionName,
-          count: 1,
-        });
-      }
+          uri,
+          metadata,
+          traits,
+          collectionName,
+          nftRow,
+        } = processed;
 
-      nftRows.push({
-        project_id,
-        issuer: detectedIssuer,
-        taxon,
-        nft_id: nftId || `${detectedIssuer}-${taxon}-${nftRows.length}`,
-        name: metadata?.name || nft.name || nftId || "Unnamed NFT",
-        image: normalizeIpfs(metadata?.image || nft.image || ""),
-        metadata_uri: uri,
-        traits,
-        updated_at: new Date().toISOString(),
-      });
+        if (metadata) metadataFound++;
+        if (!metadata && uri) failedMetadata++;
+        if (traits.length > 0) traitsFound += traits.length;
 
-      for (const trait of traits) {
-        const key = `${detectedIssuer}|||${taxon}|||${trait.trait_type}|||${trait.trait_value}`;
-        traitCounts.set(key, (traitCounts.get(key) || 0) + 1);
+        const collectionKey = `${detectedIssuer}|${taxon}`;
+
+        const existing = collectionMap.get(collectionKey);
+
+        if (existing) {
+          existing.count += 1;
+
+          if (
+            existing.name.startsWith("Taxon ") &&
+            !collectionName.startsWith("Taxon ")
+          ) {
+            existing.name = collectionName;
+          }
+        } else {
+          collectionMap.set(collectionKey, {
+            issuer: detectedIssuer,
+            taxon,
+            name: collectionName,
+            count: 1,
+          });
+        }
+
+        nftRows.push(nftRow);
+
+        for (const trait of traits) {
+          const key = `${detectedIssuer}|||${taxon}|||${trait.trait_type}|||${trait.trait_value}`;
+          traitCounts.set(key, (traitCounts.get(key) || 0) + 1);
+        }
       }
     }
 
@@ -526,10 +762,10 @@ export async function POST(req: Request) {
       savedCollections = data || [];
     }
 
-    if (nftRows.length > 0) {
+    for (const nftRowChunk of chunkNfts(nftRows, 500)) {
       const { error: nftError } = await supabase
         .from("collection_nfts")
-        .upsert(nftRows, {
+        .upsert(nftRowChunk, {
           onConflict: "project_id,nft_id",
         });
 
@@ -554,15 +790,20 @@ export async function POST(req: Request) {
     });
 
     if (traitRows.length > 0) {
-      const { error: traitError } = await supabase
-        .from("collection_traits")
-        .upsert(traitRows, {
-          onConflict: "project_id,issuer,taxon,trait_type,trait_value",
-        });
+      for (const traitRowChunk of chunkNfts(traitRows, 500)) {
+        const { error: traitError } = await supabase
+          .from("collection_traits")
+          .upsert(traitRowChunk, {
+            onConflict: "project_id,issuer,taxon,trait_type,trait_value",
+          });
 
-      if (traitError) {
-        console.error("TRAIT UPSERT ERROR:", traitError);
-        return NextResponse.json({ error: traitError.message }, { status: 500 });
+        if (traitError) {
+          console.error("TRAIT UPSERT ERROR:", traitError);
+          return NextResponse.json(
+            { error: traitError.message },
+            { status: 500 }
+          );
+        }
       }
     }
 
@@ -571,6 +812,7 @@ export async function POST(req: Request) {
       issuer,
       requested_taxon: requestedTaxon || null,
       pages_scanned: pagesScanned,
+      expected_total_nfts: expectedTotalNfts || null,
       total_nfts_scanned: allNfts.length,
       total_nfts: matchedNfts,
       collections: savedCollections,
@@ -579,9 +821,18 @@ export async function POST(req: Request) {
       traits_found: traitsFound,
       trait_types_found: traitRows.length,
       raw_hint: {
+        expected_total_nfts: expectedTotalNfts || null,
         first_response_keys:
           lastBithompResponse && typeof lastBithompResponse === "object"
             ? Object.keys(lastBithompResponse)
+            : [],
+        first_nft_keys:
+          allNfts[0] && typeof allNfts[0] === "object"
+            ? Object.keys(allNfts[0])
+            : [],
+        first_nft_metadata_keys:
+          allNfts[0]?.metadata && typeof allNfts[0].metadata === "object"
+            ? Object.keys(allNfts[0].metadata)
             : [],
       },
     });
@@ -596,4 +847,14 @@ export async function POST(req: Request) {
       { status: 500 }
     );
   }
+}
+
+function chunkNfts<T>(items: T[], size: number) {
+  const chunks: T[][] = [];
+
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+
+  return chunks;
 }

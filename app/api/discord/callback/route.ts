@@ -1,6 +1,27 @@
 import { NextResponse } from "next/server";
 import { supabaseAdmin as supabase } from "@/lib/supabase";
 
+function getReturnTo(req: Request) {
+  const { searchParams } = new URL(req.url);
+  const state = searchParams.get("state");
+
+  if (!state) return "/dashboard";
+
+  try {
+    const decoded = JSON.parse(Buffer.from(state, "base64url").toString("utf8"));
+    const returnTo = String(decoded.returnTo || "/dashboard");
+
+    // Prevent open redirect abuse. Only allow internal paths.
+    if (!returnTo.startsWith("/") || returnTo.startsWith("//")) {
+      return "/dashboard";
+    }
+
+    return returnTo;
+  } catch {
+    return "/dashboard";
+  }
+}
+
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const code = searchParams.get("code");
@@ -59,7 +80,8 @@ export async function GET(req: Request) {
       { onConflict: "discord_id" }
     );
 
-    const response = NextResponse.redirect(new URL("/dashboard", req.url));
+    const returnTo = getReturnTo(req);
+    const response = NextResponse.redirect(new URL(returnTo, req.url));
 
     const cookieOptions = {
       httpOnly: true,

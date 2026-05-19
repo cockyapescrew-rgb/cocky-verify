@@ -49,6 +49,11 @@ type Requirement = {
   trait_value: string;
 };
 
+type RequirementGroup = {
+  group_id: number;
+  requirements: Requirement[];
+};
+
 type SavedRequirement = {
   id: string;
   requirement_type: string;
@@ -58,6 +63,14 @@ type SavedRequirement = {
   trait_type?: string | null;
   trait_value?: string | null;
   logic?: string | null;
+  group_id?: number | null;
+  group_operator?: string | null;
+};
+
+type SavedRequirementGroup = {
+  group_id: number;
+  group_operator?: string | null;
+  requirements: SavedRequirement[];
 };
 
 type SavedRule = {
@@ -66,6 +79,7 @@ type SavedRule = {
   role_name?: string | null;
   created_at?: string;
   role_rule_requirements?: SavedRequirement[];
+  requirement_groups?: SavedRequirementGroup[];
 };
 
 type ScanResult = {
@@ -137,6 +151,24 @@ function getXrplAddressFromSession(session: any) {
   return parts[parts.length - 1] || "";
 }
 
+function createBlankRequirement(): Requirement {
+  return {
+    requirement_type: "nft_count",
+    issuer: "",
+    taxon: "",
+    min_nft_count: "1",
+    trait_type: "",
+    trait_value: "",
+  };
+}
+
+function createBlankGroup(groupId: number): RequirementGroup {
+  return {
+    group_id: groupId,
+    requirements: [createBlankRequirement()],
+  };
+}
+
 export default function ProjectPage({
   params,
 }: {
@@ -187,15 +219,14 @@ export default function ProjectPage({
 
   const [tipAmount, setTipAmount] = useState("5");
 
-  const [requirements, setRequirements] = useState<Requirement[]>([
-    {
-      requirement_type: "nft_count",
-      issuer: "",
-      taxon: "",
-      min_nft_count: "1",
-      trait_type: "",
-      trait_value: "",
-    },
+  const [requirementGroups, setRequirementGroups] = useState<
+    RequirementGroup[]
+  >([createBlankGroup(1)]);
+
+  const [openRoleIds, setOpenRoleIds] = useState<string[]>([]);
+  const [openGroupIds, setOpenGroupIds] = useState<number[]>([1]);
+  const [openRequirementKeys, setOpenRequirementKeys] = useState<string[]>([
+    "1-0",
   ]);
 
   const discordDisplayName =
@@ -206,6 +237,19 @@ export default function ProjectPage({
       ? `https://cdn.discordapp.com/avatars/${discordUser.id}/${discordUser.avatar}.png`
       : null;
 
+  const sortedRoles = useMemo(() => {
+    return [...roles].sort((a, b) => a.name.localeCompare(b.name));
+  }, [roles]);
+
+  const sortedCollections = useMemo(() => {
+    return [...collections].sort((a, b) => {
+      const nameA = a.name || `Taxon ${a.taxon}`;
+      const nameB = b.name || `Taxon ${b.taxon}`;
+
+      return nameA.localeCompare(nameB);
+    });
+  }, [collections]);
+
   const selectedAdvancedCollection = useMemo(() => {
     if (!advancedCollectionKey) return null;
 
@@ -214,10 +258,27 @@ export default function ProjectPage({
     return (
       collections.find(
         (collection) =>
-          collection.issuer === issuer && String(collection.taxon) === String(taxon),
+          collection.issuer === issuer &&
+          String(collection.taxon) === String(taxon),
       ) || null
     );
   }, [advancedCollectionKey, collections]);
+
+  const traitTypes = useMemo(() => {
+    return Array.from(new Set(traits.map((t) => t.trait_type))).sort((a, b) =>
+      a.localeCompare(b),
+    );
+  }, [traits]);
+
+  function getTraitValues(type: string) {
+    return Array.from(
+      new Set(
+        traits
+          .filter((t) => t.trait_type === type)
+          .map((t) => t.trait_value),
+      ),
+    ).sort((a, b) => a.localeCompare(b));
+  }
 
   function shortWallet(address: string) {
     if (!address) return "";
@@ -712,7 +773,10 @@ export default function ProjectPage({
       if (data.success) {
         await Promise.all([
           loadCollections(),
-          loadTraits(selectedAdvancedCollection.issuer, selectedAdvancedCollection.taxon),
+          loadTraits(
+            selectedAdvancedCollection.issuer,
+            selectedAdvancedCollection.taxon,
+          ),
         ]);
         setAdvancedNftId("");
         setAdvancedMetadataUri("");
@@ -791,48 +855,6 @@ export default function ProjectPage({
     }
   }
 
-  function addRequirement() {
-    setRequirements([
-      ...requirements,
-      {
-        requirement_type: "nft_count",
-        issuer: "",
-        taxon: "",
-        min_nft_count: "1",
-        trait_type: "",
-        trait_value: "",
-      },
-    ]);
-  }
-
-  function removeRequirement(index: number) {
-    setRequirements(requirements.filter((_, i) => i !== index));
-  }
-
-  function updateRequirement(
-    index: number,
-    field: keyof Requirement,
-    value: string,
-  ) {
-    const updated = [...requirements];
-    updated[index][field] = value;
-    setRequirements(updated);
-
-    if ((field === "issuer" || field === "taxon") && updated[index].issuer) {
-      loadTraits(updated[index].issuer, updated[index].taxon);
-    }
-  }
-
-  const traitTypes = useMemo(() => {
-    return Array.from(new Set(traits.map((t) => t.trait_type)));
-  }, [traits]);
-
-  function getTraitValues(type: string) {
-    return traits
-      .filter((t) => t.trait_type === type)
-      .map((t) => t.trait_value);
-  }
-
   function roleLabel(roleId: string, fallback?: string | null) {
     return roles.find((role) => role.id === roleId)?.name || fallback || roleId;
   }
@@ -845,38 +867,198 @@ export default function ProjectPage({
     return collection?.name || `Taxon ${taxon || "Any"}`;
   }
 
+  function requirementLabel(req: Requirement | SavedRequirement) {
+    const collection = collectionLabel(req.issuer, req.taxon);
+
+    if (req.requirement_type === "trait") {
+      return `NFT Trait • ${collection} • ${req.trait_type || "Trait"} = ${
+        req.trait_value || "Value"
+      }`;
+    }
+
+    return `NFT Quantity • ${collection} • Min ${
+      req.min_nft_count || "1"
+    }`;
+  }
+
+  function groupPreview(group: RequirementGroup) {
+    return group.requirements.map(requirementLabel).join(" AND ");
+  }
+
+  function savedGroupPreview(group: SavedRequirementGroup) {
+    return group.requirements.map(requirementLabel).join(" AND ");
+  }
+
+  function toggleRoleOpen(ruleId: string) {
+    setOpenRoleIds((current) =>
+      current.includes(ruleId)
+        ? current.filter((id) => id !== ruleId)
+        : [...current, ruleId],
+    );
+  }
+
+  function toggleGroupOpen(groupId: number) {
+    setOpenGroupIds((current) =>
+      current.includes(groupId)
+        ? current.filter((id) => id !== groupId)
+        : [...current, groupId],
+    );
+  }
+
+  function toggleRequirementOpen(groupId: number, requirementIndex: number) {
+    const key = `${groupId}-${requirementIndex}`;
+
+    setOpenRequirementKeys((current) =>
+      current.includes(key)
+        ? current.filter((item) => item !== key)
+        : [...current, key],
+    );
+  }
+
+  function addOrGroup() {
+    const nextId =
+      requirementGroups.length > 0
+        ? Math.max(...requirementGroups.map((group) => group.group_id)) + 1
+        : 1;
+
+    setRequirementGroups([...requirementGroups, createBlankGroup(nextId)]);
+    setOpenGroupIds((current) => [...current, nextId]);
+    setOpenRequirementKeys((current) => [...current, `${nextId}-0`]);
+  }
+
+  function removeGroup(groupIndex: number) {
+    if (requirementGroups.length === 1) {
+      setRequirementGroups([createBlankGroup(1)]);
+      setOpenGroupIds([1]);
+      setOpenRequirementKeys(["1-0"]);
+      return;
+    }
+
+    setRequirementGroups(requirementGroups.filter((_, i) => i !== groupIndex));
+  }
+
+  function addAndRequirement(groupIndex: number) {
+    const updated = [...requirementGroups];
+    const group = updated[groupIndex];
+
+    group.requirements = [...group.requirements, createBlankRequirement()];
+    updated[groupIndex] = group;
+
+    setRequirementGroups(updated);
+    setOpenGroupIds((current) =>
+      current.includes(group.group_id) ? current : [...current, group.group_id],
+    );
+    setOpenRequirementKeys((current) => [
+      ...current,
+      `${group.group_id}-${group.requirements.length - 1}`,
+    ]);
+  }
+
+  function removeRequirement(groupIndex: number, requirementIndex: number) {
+    const updated = [...requirementGroups];
+    const group = updated[groupIndex];
+
+    if (group.requirements.length === 1) {
+      removeGroup(groupIndex);
+      return;
+    }
+
+    group.requirements = group.requirements.filter(
+      (_, i) => i !== requirementIndex,
+    );
+
+    updated[groupIndex] = group;
+
+    setRequirementGroups(updated);
+  }
+
+  function updateRequirement(
+    groupIndex: number,
+    requirementIndex: number,
+    field: keyof Requirement,
+    value: string,
+  ) {
+    const updated = [...requirementGroups];
+    const group = updated[groupIndex];
+    const requirement = { ...group.requirements[requirementIndex] };
+
+    requirement[field] = value;
+
+    group.requirements[requirementIndex] = requirement;
+    updated[groupIndex] = group;
+
+    setRequirementGroups(updated);
+
+    if ((field === "issuer" || field === "taxon") && requirement.issuer) {
+      loadTraits(requirement.issuer, requirement.taxon);
+    }
+  }
+
+  function groupSavedRequirements(rule: SavedRule): SavedRequirementGroup[] {
+    if (rule.requirement_groups && rule.requirement_groups.length > 0) {
+      return rule.requirement_groups;
+    }
+
+    const map = new Map<number, SavedRequirement[]>();
+
+    (rule.role_rule_requirements || []).forEach((req, index) => {
+      const groupId = Number(req.group_id || index + 1);
+
+      if (!map.has(groupId)) {
+        map.set(groupId, []);
+      }
+
+      map.get(groupId)!.push({
+        ...req,
+        group_id: groupId,
+        group_operator: req.group_operator || "AND",
+      });
+    });
+
+    return Array.from(map.entries())
+      .map(([group_id, requirements]) => ({
+        group_id,
+        group_operator: "AND",
+        requirements,
+      }))
+      .sort((a, b) => a.group_id - b.group_id);
+  }
+
   function editRule(rule: SavedRule) {
     setEditingRuleId(rule.id);
     setSelectedRole(rule.discord_role_id);
 
-    const loadedRequirements =
-      rule.role_rule_requirements?.map((req) => ({
-        requirement_type: req.requirement_type || "nft_count",
-        issuer: req.issuer || "",
-        taxon: req.taxon || "",
-        min_nft_count: String(req.min_nft_count || 1),
-        trait_type: req.trait_type || "",
-        trait_value: req.trait_value || "",
-      })) || [];
+    const groups = groupSavedRequirements(rule);
 
-    setRequirements(
-      loadedRequirements.length > 0
-        ? loadedRequirements
-        : [
-            {
-              requirement_type: "nft_count",
-              issuer: "",
-              taxon: "",
-              min_nft_count: "1",
-              trait_type: "",
-              trait_value: "",
-            },
-          ],
+    const loadedGroups =
+      groups.length > 0
+        ? groups.map((group, index) => ({
+            group_id: Number(group.group_id || index + 1),
+            requirements: group.requirements.map((req) => ({
+              requirement_type: req.requirement_type || "nft_count",
+              issuer: req.issuer || "",
+              taxon: req.taxon || "",
+              min_nft_count: String(req.min_nft_count || 1),
+              trait_type: req.trait_type || "",
+              trait_value: req.trait_value || "",
+            })),
+          }))
+        : [createBlankGroup(1)];
+
+    setRequirementGroups(loadedGroups);
+    setOpenGroupIds(loadedGroups.map((group) => group.group_id));
+    setOpenRequirementKeys(
+      loadedGroups.flatMap((group) =>
+        group.requirements.map((_, index) => `${group.group_id}-${index}`),
+      ),
     );
 
-    const firstReq = loadedRequirements[0];
-    if (firstReq?.issuer) {
-      loadTraits(firstReq.issuer, firstReq.taxon);
+    for (const group of loadedGroups) {
+      for (const req of group.requirements) {
+        if (req.issuer) {
+          loadTraits(req.issuer, req.taxon);
+        }
+      }
     }
 
     window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
@@ -922,17 +1104,21 @@ export default function ProjectPage({
     const { id } = await params;
     const role = roles.find((r) => r.id === selectedRole);
 
-    const cleanedRequirements = requirements
-      .filter((req) => req.issuer)
-      .map((req) => ({
-        requirement_type: req.requirement_type,
-        issuer: req.issuer,
-        taxon: req.taxon || null,
-        min_nft_count: Number(req.min_nft_count || 1),
-        trait_type: req.requirement_type === "trait" ? req.trait_type : null,
-        trait_value: req.requirement_type === "trait" ? req.trait_value : null,
-        logic: "OR",
-      }));
+    const cleanedRequirements = requirementGroups.flatMap((group) =>
+      group.requirements
+        .filter((req) => req.issuer)
+        .map((req) => ({
+          requirement_type: req.requirement_type,
+          issuer: req.issuer,
+          taxon: req.taxon || null,
+          min_nft_count: Number(req.min_nft_count || 1),
+          trait_type: req.requirement_type === "trait" ? req.trait_type : null,
+          trait_value: req.requirement_type === "trait" ? req.trait_value : null,
+          logic: "OR",
+          group_id: group.group_id,
+          group_operator: "AND",
+        })),
+    );
 
     if (!selectedRole) {
       alert("Select a Discord role first.");
@@ -1237,7 +1423,7 @@ export default function ProjectPage({
               className="mt-6 w-full rounded-2xl border border-zinc-700 bg-black/50 px-5 py-4 text-lg font-bold text-white outline-none"
             >
               <option value="">Select Discord Role</option>
-              {roles.map((role) => (
+              {sortedRoles.map((role) => (
                 <option key={role.id} value={role.id}>
                   {role.name}
                 </option>
@@ -1367,7 +1553,7 @@ export default function ProjectPage({
                 className="mt-4 w-full rounded-2xl border border-zinc-700 bg-black/60 px-5 py-4 text-base font-bold text-white outline-none"
               >
                 <option value="">Select Collection To Update</option>
-                {collections.map((collection) => (
+                {sortedCollections.map((collection) => (
                   <option
                     key={collection.id}
                     value={`${collection.issuer}|${collection.taxon}`}
@@ -1408,7 +1594,9 @@ export default function ProjectPage({
                 disabled={advancedScanning}
                 className="mt-4 w-full rounded-2xl bg-yellow-400 px-6 py-4 text-sm font-black uppercase text-black hover:bg-yellow-300 disabled:opacity-50"
               >
-                {advancedScanning ? "Scanning Single NFT..." : "Scan Single NFT / Metadata"}
+                {advancedScanning
+                  ? "Scanning Single NFT..."
+                  : "Scan Single NFT / Metadata"}
               </button>
 
               {advancedScanResult && (
@@ -1434,7 +1622,8 @@ export default function ProjectPage({
                   {advancedScanResult.success ? (
                     <>
                       <p className="mt-2 break-all text-zinc-300">
-                        NFT: {advancedScanResult.name || advancedScanResult.nft_id}
+                        NFT:{" "}
+                        {advancedScanResult.name || advancedScanResult.nft_id}
                       </p>
                       <p className="mt-1 break-all text-xs text-zinc-500">
                         Metadata: {advancedScanResult.metadata_uri || "N/A"}
@@ -1446,17 +1635,26 @@ export default function ProjectPage({
                       {advancedScanResult.traits &&
                         advancedScanResult.traits.length > 0 && (
                           <div className="mt-3 max-h-44 overflow-auto rounded-xl border border-zinc-800 bg-black/40 p-3">
-                            {advancedScanResult.traits.map((trait, index) => (
-                              <p
-                                key={`${trait.trait_type}-${trait.trait_value}-${index}`}
-                                className="text-xs text-zinc-300"
-                              >
-                                <span className="font-black text-yellow-300">
-                                  {trait.trait_type}:
-                                </span>{" "}
-                                {trait.trait_value}
-                              </p>
-                            ))}
+                            {[...advancedScanResult.traits]
+                              .sort((a, b) => {
+                                const typeCompare =
+                                  a.trait_type.localeCompare(b.trait_type);
+                                if (typeCompare !== 0) return typeCompare;
+                                return a.trait_value.localeCompare(
+                                  b.trait_value,
+                                );
+                              })
+                              .map((trait, index) => (
+                                <p
+                                  key={`${trait.trait_type}-${trait.trait_value}-${index}`}
+                                  className="text-xs text-zinc-300"
+                                >
+                                  <span className="font-black text-yellow-300">
+                                    {trait.trait_type}:
+                                  </span>{" "}
+                                  {trait.trait_value}
+                                </p>
+                              ))}
                           </div>
                         )}
                     </>
@@ -1478,12 +1676,12 @@ export default function ProjectPage({
             <h3 className="text-2xl font-black text-white">Collections</h3>
 
             <div className="mt-6 space-y-3">
-              {collections.length === 0 ? (
+              {sortedCollections.length === 0 ? (
                 <p className="rounded-2xl border border-zinc-800 bg-black/40 p-4 text-sm text-zinc-500">
                   No collections indexed yet.
                 </p>
               ) : (
-                collections.map((collection) => {
+                sortedCollections.map((collection) => {
                   const displayName =
                     collection.name || `Taxon ${collection.taxon}`;
                   const isOpen = openCollectionId === collection.id;
@@ -1548,7 +1746,9 @@ export default function ProjectPage({
 
         <section className="mt-6 grid gap-6 lg:grid-cols-[0.75fr_1.25fr]">
           <div className="rounded-3xl border border-[#3a2b16] bg-[#15110c] p-7">
-            <h3 className="text-3xl font-black text-white">Programmed Roles</h3>
+            <h3 className="text-3xl font-black text-white">
+              Programmed Roles
+            </h3>
 
             <div className="mt-6 space-y-4">
               {savedRules.length === 0 ? (
@@ -1556,61 +1756,115 @@ export default function ProjectPage({
                   No saved rules yet.
                 </p>
               ) : (
-                savedRules.map((rule) => (
-                  <div
-                    key={rule.id}
-                    className="rounded-2xl border border-zinc-800 bg-black/45 p-4"
-                  >
-                    <p className="text-xl font-black text-yellow-400">
-                      {roleLabel(rule.discord_role_id, rule.role_name)}
-                    </p>
+                savedRules.map((rule) => {
+                  const isOpen = openRoleIds.includes(rule.id);
+                  const groups = groupSavedRequirements(rule);
 
-                    <div className="mt-4 space-y-3">
-                      {(rule.role_rule_requirements || []).map((req) => (
-                        <div
-                          key={req.id}
-                          className="rounded-xl border border-zinc-800 bg-black/50 p-3"
-                        >
-                          <p className="text-xs font-black uppercase tracking-[0.25em] text-cyan-400">
-                            {req.requirement_type === "trait"
-                              ? "Trait Gate"
-                              : "NFT Quantity"}
+                  return (
+                    <div
+                      key={rule.id}
+                      className="rounded-2xl border border-zinc-800 bg-black/45 p-4"
+                    >
+                      <button
+                        onClick={() => toggleRoleOpen(rule.id)}
+                        className="flex w-full items-start justify-between gap-4 text-left"
+                      >
+                        <div>
+                          <p className="text-xl font-black text-yellow-400">
+                            {roleLabel(rule.discord_role_id, rule.role_name)}
                           </p>
 
-                          <p className="mt-2 text-sm text-zinc-300">
-                            {collectionLabel(req.issuer, req.taxon)}
+                          <p className="mt-2 text-xs text-zinc-500">
+                            {groups.length} OR group
+                            {groups.length === 1 ? "" : "s"} •{" "}
+                            {(rule.role_rule_requirements || []).length} total
+                            requirement
+                            {(rule.role_rule_requirements || []).length === 1
+                              ? ""
+                              : "s"}
                           </p>
 
-                          {req.requirement_type === "trait" ? (
-                            <p className="mt-1 text-sm text-zinc-400">
-                              {req.trait_type}: {req.trait_value}
-                            </p>
-                          ) : (
-                            <p className="mt-1 text-sm text-zinc-400">
-                              Min NFTs: {req.min_nft_count || 1}
+                          {!isOpen && groups[0] && (
+                            <p className="mt-2 line-clamp-2 text-xs text-zinc-400">
+                              {savedGroupPreview(groups[0])}
                             </p>
                           )}
                         </div>
-                      ))}
-                    </div>
 
-                    <div className="mt-4 flex gap-2">
-                      <button
-                        onClick={() => editRule(rule)}
-                        className="rounded-xl border border-cyan-500 px-3 py-2 text-xs font-black uppercase text-cyan-400 hover:bg-cyan-500/10"
-                      >
-                        Edit
+                        <span className="rounded-full border border-cyan-500 px-3 py-1 text-xs font-black text-cyan-400">
+                          {isOpen ? "Collapse" : "Expand"}
+                        </span>
                       </button>
 
-                      <button
-                        onClick={() => deleteRule(rule.id)}
-                        className="rounded-xl border border-red-500 px-3 py-2 text-xs font-black uppercase text-red-400 hover:bg-red-500/10"
-                      >
-                        Delete
-                      </button>
+                      {isOpen && (
+                        <>
+                          <div className="mt-4 space-y-3">
+                            {groups.map((group, groupIndex) => (
+                              <div
+                                key={`${rule.id}-${group.group_id}`}
+                                className="rounded-xl border border-zinc-800 bg-black/50 p-3"
+                              >
+                                <p className="text-xs font-black uppercase tracking-[0.25em] text-cyan-400">
+                                  OR Group {groupIndex + 1}
+                                </p>
+
+                                <p className="mt-1 text-xs text-zinc-500">
+                                  All items inside this group are required
+                                  together.
+                                </p>
+
+                                <div className="mt-3 space-y-2">
+                                  {group.requirements.map((req) => (
+                                    <div
+                                      key={req.id}
+                                      className="rounded-xl border border-zinc-800 bg-black/40 p-3"
+                                    >
+                                      <p className="text-xs font-black uppercase tracking-[0.25em] text-cyan-400">
+                                        {req.requirement_type === "trait"
+                                          ? "Trait Gate"
+                                          : "NFT Quantity"}
+                                      </p>
+
+                                      <p className="mt-2 text-sm text-zinc-300">
+                                        {collectionLabel(req.issuer, req.taxon)}
+                                      </p>
+
+                                      {req.requirement_type === "trait" ? (
+                                        <p className="mt-1 text-sm text-zinc-400">
+                                          {req.trait_type}: {req.trait_value}
+                                        </p>
+                                      ) : (
+                                        <p className="mt-1 text-sm text-zinc-400">
+                                          Min NFTs: {req.min_nft_count || 1}
+                                        </p>
+                                      )}
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+
+                          <div className="mt-4 flex gap-2">
+                            <button
+                              onClick={() => editRule(rule)}
+                              className="rounded-xl border border-cyan-500 px-3 py-2 text-xs font-black uppercase text-cyan-400 hover:bg-cyan-500/10"
+                            >
+                              Edit
+                            </button>
+
+                            <button
+                              onClick={() => deleteRule(rule.id)}
+                              className="rounded-xl border border-red-500 px-3 py-2 text-xs font-black uppercase text-red-400 hover:bg-red-500/10"
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        </>
+                      )}
                     </div>
-                  </div>
-                ))
+                  );
+                })
               )}
             </div>
           </div>
@@ -1625,7 +1879,7 @@ export default function ProjectPage({
                 <p className="mt-2 text-sm text-zinc-500">
                   {editingRuleId
                     ? "Editing saved role rule."
-                    : "Add multiple ways to qualify for the selected Discord role."}
+                    : "OR groups qualify separately. Requirements inside one group are AND."}
                 </p>
               </div>
 
@@ -1638,116 +1892,248 @@ export default function ProjectPage({
             </div>
 
             <div className="grid gap-5">
-              {requirements.map((req, index) => (
-                <div
-                  key={index}
-                  className="rounded-3xl border border-zinc-800 bg-black/45 p-5"
-                >
-                  <div className="mb-4 flex items-center justify-between">
-                    <p className="text-xs font-black uppercase tracking-[0.35em] text-cyan-400">
-                      Requirement {index + 1}
-                    </p>
+              {requirementGroups.map((group, groupIndex) => {
+                const isGroupOpen = openGroupIds.includes(group.group_id);
 
-                    {requirements.length > 1 && (
+                return (
+                  <div
+                    key={group.group_id}
+                    className="rounded-3xl border border-cyan-500/25 bg-black/45 p-5"
+                  >
+                    <div className="mb-4 flex items-start justify-between gap-3">
                       <button
-                        onClick={() => removeRequirement(index)}
-                        className="rounded-full bg-red-950 px-3 py-1 text-xs font-black text-red-300 hover:bg-red-800"
+                        onClick={() => toggleGroupOpen(group.group_id)}
+                        className="text-left"
                       >
-                        Remove
+                        <p className="text-xs font-black uppercase tracking-[0.35em] text-cyan-400">
+                          OR Group {groupIndex + 1}
+                        </p>
+
+                        <p className="mt-1 text-xs text-zinc-500">
+                          Requirements inside this group are paired with AND.
+                        </p>
+
+                        {!isGroupOpen && (
+                          <p className="mt-2 line-clamp-2 text-sm font-bold text-white">
+                            {groupPreview(group) || "Empty group"}
+                          </p>
+                        )}
                       </button>
+
+                      <div className="flex shrink-0 gap-2">
+                        <button
+                          onClick={() => toggleGroupOpen(group.group_id)}
+                          className="rounded-full border border-cyan-500 px-3 py-1 text-xs font-black text-cyan-400 hover:bg-cyan-500/10"
+                        >
+                          {isGroupOpen ? "Collapse" : "Expand"}
+                        </button>
+
+                        <button
+                          onClick={() => removeGroup(groupIndex)}
+                          className="rounded-full bg-red-950 px-3 py-1 text-xs font-black text-red-300 hover:bg-red-800"
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    </div>
+
+                    {isGroupOpen && (
+                      <div className="space-y-4">
+                        {group.requirements.map((req, requirementIndex) => {
+                          const requirementKey = `${group.group_id}-${requirementIndex}`;
+                          const isRequirementOpen =
+                            openRequirementKeys.includes(requirementKey);
+
+                          return (
+                            <div
+                              key={requirementKey}
+                              className="rounded-2xl border border-zinc-800 bg-black/60 p-4"
+                            >
+                              <div className="flex items-start justify-between gap-3">
+                                <button
+                                  onClick={() =>
+                                    toggleRequirementOpen(
+                                      group.group_id,
+                                      requirementIndex,
+                                    )
+                                  }
+                                  className="text-left"
+                                >
+                                  <p className="text-xs font-black uppercase tracking-[0.25em] text-yellow-300">
+                                    AND Requirement {requirementIndex + 1}
+                                  </p>
+
+                                  <p className="mt-2 text-sm font-black text-white">
+                                    {requirementLabel(req)}
+                                  </p>
+                                </button>
+
+                                <div className="flex shrink-0 gap-2">
+                                  <button
+                                    onClick={() =>
+                                      toggleRequirementOpen(
+                                        group.group_id,
+                                        requirementIndex,
+                                      )
+                                    }
+                                    className="rounded-full border border-yellow-400 px-3 py-1 text-xs font-black text-yellow-300 hover:bg-yellow-400/10"
+                                  >
+                                    {isRequirementOpen ? "Collapse" : "Edit"}
+                                  </button>
+
+                                  <button
+                                    onClick={() =>
+                                      removeRequirement(
+                                        groupIndex,
+                                        requirementIndex,
+                                      )
+                                    }
+                                    className="rounded-full bg-red-950 px-3 py-1 text-xs font-black text-red-300 hover:bg-red-800"
+                                  >
+                                    Remove
+                                  </button>
+                                </div>
+                              </div>
+
+                              {isRequirementOpen && (
+                                <div className="mt-4">
+                                  <select
+                                    value={req.requirement_type}
+                                    onChange={(e) =>
+                                      updateRequirement(
+                                        groupIndex,
+                                        requirementIndex,
+                                        "requirement_type",
+                                        e.target.value,
+                                      )
+                                    }
+                                    className="w-full rounded-2xl border border-zinc-700 bg-black/60 px-5 py-4 text-base font-bold text-white outline-none"
+                                  >
+                                    <option value="nft_count">
+                                      NFT Quantity
+                                    </option>
+                                    <option value="trait">NFT Trait</option>
+                                  </select>
+
+                                  <select
+                                    value={`${req.issuer}|${req.taxon}`}
+                                    onChange={(e) => {
+                                      const [issuer, taxon] =
+                                        e.target.value.split("|");
+                                      updateRequirement(
+                                        groupIndex,
+                                        requirementIndex,
+                                        "issuer",
+                                        issuer || "",
+                                      );
+                                      updateRequirement(
+                                        groupIndex,
+                                        requirementIndex,
+                                        "taxon",
+                                        taxon || "",
+                                      );
+                                    }}
+                                    className="mt-4 w-full rounded-2xl border border-zinc-700 bg-black/60 px-5 py-4 text-base font-bold text-white outline-none"
+                                  >
+                                    <option value="|">Select Collection</option>
+                                    {sortedCollections.map((collection) => (
+                                      <option
+                                        key={collection.id}
+                                        value={`${collection.issuer}|${collection.taxon}`}
+                                      >
+                                        {collection.name ||
+                                          `Taxon ${collection.taxon}`}
+                                      </option>
+                                    ))}
+                                  </select>
+
+                                  <input
+                                    value={req.min_nft_count}
+                                    onChange={(e) =>
+                                      updateRequirement(
+                                        groupIndex,
+                                        requirementIndex,
+                                        "min_nft_count",
+                                        e.target.value,
+                                      )
+                                    }
+                                    placeholder="Minimum NFTs Owned"
+                                    className="mt-4 w-full rounded-2xl border border-zinc-700 bg-black/60 px-5 py-4 text-base font-bold text-white outline-none"
+                                  />
+
+                                  {req.requirement_type === "trait" && (
+                                    <>
+                                      <select
+                                        value={req.trait_type}
+                                        onChange={(e) =>
+                                          updateRequirement(
+                                            groupIndex,
+                                            requirementIndex,
+                                            "trait_type",
+                                            e.target.value,
+                                          )
+                                        }
+                                        className="mt-4 w-full rounded-2xl border border-zinc-700 bg-black/60 px-5 py-4 text-base font-bold text-white outline-none"
+                                      >
+                                        <option value="">
+                                          Select Trait Type
+                                        </option>
+                                        {traitTypes.map((type) => (
+                                          <option key={type} value={type}>
+                                            {type}
+                                          </option>
+                                        ))}
+                                      </select>
+
+                                      <select
+                                        value={req.trait_value}
+                                        onChange={(e) =>
+                                          updateRequirement(
+                                            groupIndex,
+                                            requirementIndex,
+                                            "trait_value",
+                                            e.target.value,
+                                          )
+                                        }
+                                        className="mt-4 w-full rounded-2xl border border-zinc-700 bg-black/60 px-5 py-4 text-base font-bold text-white outline-none"
+                                      >
+                                        <option value="">
+                                          Select Trait Value
+                                        </option>
+                                        {getTraitValues(req.trait_type).map(
+                                          (value) => (
+                                            <option key={value} value={value}>
+                                              {value}
+                                            </option>
+                                          ),
+                                        )}
+                                      </select>
+                                    </>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+
+                        <button
+                          onClick={() => addAndRequirement(groupIndex)}
+                          className="w-full rounded-2xl border border-yellow-400 bg-yellow-400/10 py-3 text-sm font-black uppercase text-yellow-300 transition hover:bg-yellow-400/20"
+                        >
+                          + Add AND Requirement To This Group
+                        </button>
+                      </div>
                     )}
                   </div>
-
-                  <select
-                    value={req.requirement_type}
-                    onChange={(e) =>
-                      updateRequirement(
-                        index,
-                        "requirement_type",
-                        e.target.value,
-                      )
-                    }
-                    className="w-full rounded-2xl border border-zinc-700 bg-black/60 px-5 py-4 text-base font-bold text-white outline-none"
-                  >
-                    <option value="nft_count">NFT Quantity</option>
-                    <option value="trait">NFT Trait</option>
-                  </select>
-
-                  <select
-                    value={`${req.issuer}|${req.taxon}`}
-                    onChange={(e) => {
-                      const [issuer, taxon] = e.target.value.split("|");
-                      updateRequirement(index, "issuer", issuer || "");
-                      updateRequirement(index, "taxon", taxon || "");
-                    }}
-                    className="mt-4 w-full rounded-2xl border border-zinc-700 bg-black/60 px-5 py-4 text-base font-bold text-white outline-none"
-                  >
-                    <option value="|">Select Collection</option>
-                    {collections.map((collection) => (
-                      <option
-                        key={collection.id}
-                        value={`${collection.issuer}|${collection.taxon}`}
-                      >
-                        {collection.name || `Taxon ${collection.taxon}`}
-                      </option>
-                    ))}
-                  </select>
-
-                  <input
-                    value={req.min_nft_count}
-                    onChange={(e) =>
-                      updateRequirement(index, "min_nft_count", e.target.value)
-                    }
-                    placeholder="Minimum NFTs Owned"
-                    className="mt-4 w-full rounded-2xl border border-zinc-700 bg-black/60 px-5 py-4 text-base font-bold text-white outline-none"
-                  />
-
-                  {req.requirement_type === "trait" && (
-                    <>
-                      <select
-                        value={req.trait_type}
-                        onChange={(e) =>
-                          updateRequirement(index, "trait_type", e.target.value)
-                        }
-                        className="mt-4 w-full rounded-2xl border border-zinc-700 bg-black/60 px-5 py-4 text-base font-bold text-white outline-none"
-                      >
-                        <option value="">Select Trait Type</option>
-                        {traitTypes.map((type) => (
-                          <option key={type} value={type}>
-                            {type}
-                          </option>
-                        ))}
-                      </select>
-
-                      <select
-                        value={req.trait_value}
-                        onChange={(e) =>
-                          updateRequirement(
-                            index,
-                            "trait_value",
-                            e.target.value,
-                          )
-                        }
-                        className="mt-4 w-full rounded-2xl border border-zinc-700 bg-black/60 px-5 py-4 text-base font-bold text-white outline-none"
-                      >
-                        <option value="">Select Trait Value</option>
-                        {getTraitValues(req.trait_type).map((value) => (
-                          <option key={value} value={value}>
-                            {value}
-                          </option>
-                        ))}
-                      </select>
-                    </>
-                  )}
-                </div>
-              ))}
+                );
+              })}
             </div>
 
             <button
-              onClick={addRequirement}
+              onClick={addOrGroup}
               className="mt-6 w-full rounded-2xl border border-cyan-500 bg-cyan-500/10 py-4 text-lg font-black text-cyan-400 transition hover:bg-cyan-500/20"
             >
-              + Add Requirement
+              + Add OR Group
             </button>
 
             {ruleSaved && (

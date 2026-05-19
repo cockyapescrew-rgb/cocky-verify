@@ -5,8 +5,65 @@ import { useEffect, useRef, useState } from "react";
 type WalletProvider = "xaman" | "joey" | "";
 type VerifyState = "idle" | "checking" | "success" | "error" | "missing-discord";
 
+type DiscordUser = {
+  id: string;
+  username?: string;
+  global_name?: string;
+  avatar?: string;
+};
+
+type DiscordGuild = {
+  id: string;
+  name: string;
+  icon?: string | null;
+  owner?: boolean;
+  permissions?: string;
+};
+
+type ScanSummary = {
+  wallet?: string;
+  discord_user_id?: string;
+  discord_guild_id?: string;
+  project_id?: string;
+  project_name?: string;
+  total_nfts_owned?: number;
+  indexed_nfts_found?: number;
+  collections?: {
+    issuer: string;
+    taxon: string;
+    name: string;
+    owned_count: number;
+    indexed_count: number;
+  }[];
+  traits?: {
+    trait_type: string;
+    value: string;
+    count: number;
+  }[];
+  rules?: {
+    role_id: string;
+    role_name: string;
+    passed: boolean;
+    logic: "OR";
+    requirements: {
+      requirement_type: string;
+      issuer: string;
+      taxon: string;
+      collection_name: string;
+      passed: boolean;
+      found_count?: number;
+      required_count?: number;
+      trait_type?: string;
+      trait_value?: string;
+      matching_trait_count?: number;
+    }[];
+  }[];
+};
+
 const WALLET_KEY = "cocky_verified_wallet";
 const PROVIDER_KEY = "cocky_verified_provider";
+const DISCORD_GUILD_KEY = "cocky_verify_guild_id";
+const DISCORD_USER_KEY = "cocky_verify_discord_id";
 
 export default function Home() {
   const [qr, setQr] = useState("");
@@ -18,17 +75,45 @@ export default function Home() {
   const [walletMode, setWalletMode] = useState<WalletProvider>("");
   const [verifyState, setVerifyState] = useState<VerifyState>("idle");
   const [verifyMessage, setVerifyMessage] = useState("");
+  const [discordUser, setDiscordUser] = useState<DiscordUser | null>(null);
+  const [guilds, setGuilds] = useState<DiscordGuild[]>([]);
+  const [selectedGuildId, setSelectedGuildId] = useState("");
+  const [discordLoading, setDiscordLoading] = useState(false);
+  const [scanSummary, setScanSummary] = useState<ScanSummary | null>(null);
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
     const savedWallet = localStorage.getItem(WALLET_KEY);
     const savedProvider = localStorage.getItem(PROVIDER_KEY) as WalletProvider | null;
+    const savedGuildId = localStorage.getItem(DISCORD_GUILD_KEY) || "";
+
+    const params = new URLSearchParams(window.location.search);
+    const guildFromUrl = params.get("guild_id") || params.get("guildId") || "";
+    const userFromUrl =
+      params.get("user_id") ||
+      params.get("userId") ||
+      params.get("discord_id") ||
+      params.get("discordId") ||
+      "";
+
+    if (guildFromUrl) {
+      setSelectedGuildId(guildFromUrl);
+      localStorage.setItem(DISCORD_GUILD_KEY, guildFromUrl);
+    } else if (savedGuildId) {
+      setSelectedGuildId(savedGuildId);
+    }
+
+    if (userFromUrl) {
+      localStorage.setItem(DISCORD_USER_KEY, userFromUrl);
+    }
 
     if (savedWallet) {
       setWallet(savedWallet);
       setWalletProvider(savedProvider || "xaman");
     }
+
+    loadDiscordSession();
   }, []);
 
   useEffect(() => {
@@ -49,15 +134,88 @@ export default function Home() {
 
     const params = new URLSearchParams(window.location.search);
 
+    const guildFromUrl = params.get("guild_id") || params.get("guildId") || "";
+    const userFromUrl =
+      params.get("user_id") ||
+      params.get("userId") ||
+      params.get("discord_id") ||
+      params.get("discordId") ||
+      "";
+
+    const savedGuildId = localStorage.getItem(DISCORD_GUILD_KEY) || "";
+    const savedUserId = localStorage.getItem(DISCORD_USER_KEY) || "";
+
     return {
-      guildId: params.get("guild_id") || params.get("guildId") || "",
-      userId:
-        params.get("user_id") ||
-        params.get("userId") ||
-        params.get("discord_id") ||
-        params.get("discordId") ||
-        "",
+      guildId: guildFromUrl || selectedGuildId || savedGuildId || "",
+      userId: userFromUrl || discordUser?.id || savedUserId || "",
     };
+  }
+
+  async function loadDiscordSession() {
+    try {
+      setDiscordLoading(true);
+
+      const meRes = await fetch("/api/discord/me", {
+        cache: "no-store",
+      });
+      const meData = await meRes.json().catch(() => ({}));
+
+      if (meData.loggedIn && meData.user) {
+        setDiscordUser(meData.user);
+        localStorage.setItem(DISCORD_USER_KEY, meData.user.id);
+
+        const guildRes = await fetch("/api/discord/guilds", {
+          cache: "no-store",
+        });
+        const guildData = await guildRes.json().catch(() => ({}));
+        const loadedGuilds = guildData.guilds || guildData.servers || [];
+
+        if (Array.isArray(loadedGuilds)) {
+          const sortedGuilds = loadedGuilds
+            .filter((guild: DiscordGuild) => guild?.id && guild?.name)
+            .sort((a: DiscordGuild, b: DiscordGuild) =>
+              a.name.localeCompare(b.name)
+            );
+
+          setGuilds(sortedGuilds);
+
+          const savedGuildId = localStorage.getItem(DISCORD_GUILD_KEY) || "";
+          const hasSavedGuild = sortedGuilds.some(
+            (guild: DiscordGuild) => guild.id === savedGuildId
+          );
+
+          if (!selectedGuildId && hasSavedGuild) {
+            setSelectedGuildId(savedGuildId);
+          }
+        }
+      }
+    } catch (err) {
+      console.warn("Discord session load skipped", err);
+    } finally {
+      setDiscordLoading(false);
+    }
+  }
+
+  function connectDiscord() {
+    const returnTo =
+      typeof window !== "undefined"
+        ? encodeURIComponent(window.location.href)
+        : "";
+
+    window.location.href = returnTo
+      ? `/api/discord/login?return_to=${returnTo}`
+      : "/api/discord/login";
+  }
+
+  function handleServerSelect(guildId: string) {
+    setSelectedGuildId(guildId);
+    setScanSummary(null);
+
+    if (guildId) {
+      localStorage.setItem(DISCORD_GUILD_KEY, guildId);
+    } else {
+      localStorage.removeItem(DISCORD_GUILD_KEY);
+    }
   }
 
   function saveWallet(address: string, provider: WalletProvider) {
@@ -82,6 +240,7 @@ export default function Home() {
     setWalletMode("");
     setVerifyState("idle");
     setVerifyMessage("");
+    setScanSummary(null);
   }
 
   async function runVerification(address: string, provider: WalletProvider) {
@@ -90,7 +249,7 @@ export default function Home() {
     if (!guildId || !userId) {
       setVerifyState("missing-discord");
       setVerifyMessage(
-        "Wallet connected. To update Discord roles, open this page from the /verifyportal button inside Discord."
+        "Wallet connected. Connect Discord and select a server, or open this page from /verifyportal inside Discord."
       );
       return;
     }
@@ -113,6 +272,10 @@ export default function Home() {
       });
 
       const data = await res.json().catch(() => ({}));
+
+      if (data.scan_summary) {
+        setScanSummary(data.scan_summary);
+      }
 
       if (!res.ok || data.success === false) {
         setVerifyState("error");
@@ -145,6 +308,7 @@ export default function Home() {
       setDeepLink("");
       setVerifyState("idle");
       setVerifyMessage("");
+      setScanSummary(null);
 
       if (pollRef.current) clearInterval(pollRef.current);
 
@@ -205,6 +369,7 @@ export default function Home() {
       setWalletModal(true);
       setVerifyState("idle");
       setVerifyMessage("");
+      setScanSummary(null);
 
       const projectId = process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID;
 
@@ -290,6 +455,26 @@ export default function Home() {
             </div>
           </div>
 
+          <div className="flex flex-wrap items-center justify-end gap-3">
+            {discordUser ? (
+              <div className="rounded-full border border-cyan-500/40 bg-cyan-500/10 px-4 py-2">
+                <p className="text-[10px] font-black uppercase tracking-[0.25em] text-cyan-300">
+                  Discord Connected
+                </p>
+                <p className="text-xs font-bold text-white">
+                  {discordUser.global_name || discordUser.username || "Discord User"}
+                </p>
+              </div>
+            ) : (
+              <button
+                onClick={connectDiscord}
+                disabled={discordLoading}
+                className="rounded-full border border-cyan-500 bg-cyan-500/10 px-5 py-3 text-xs font-black uppercase text-cyan-300 hover:bg-cyan-500/20 disabled:opacity-60"
+              >
+                {discordLoading ? "Checking Discord..." : "Connect Discord"}
+              </button>
+            )}
+
           {wallet ? (
             <div className="flex items-center gap-3 rounded-full border border-emerald-500/50 bg-emerald-500/10 px-4 py-2">
               <div>
@@ -315,6 +500,7 @@ export default function Home() {
               {loading ? "Waiting..." : "Connect Wallet"}
             </button>
           )}
+          </div>
         </header>
 
         <section className="relative overflow-hidden rounded-3xl border border-[#3a2b16] bg-black px-7 py-12 shadow-2xl">
@@ -348,9 +534,61 @@ export default function Home() {
             <h3 className="text-2xl font-black text-white">Discord Verification</h3>
 
             <p className="mt-2 text-sm text-zinc-400">
-              Connect with Xaman or Joey Wallet. Open this page through Discord
-              so Cocky Bot knows which server and user to update.
+              Connect Discord, select the server, then connect your XRPL wallet.
+              You can also open this page through /verifyportal and it will auto-fill the server.
             </p>
+
+            <div className="mt-6 rounded-2xl border border-cyan-500/30 bg-cyan-500/10 p-5">
+              <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+                <div>
+                  <p className="text-xs font-black uppercase tracking-[0.25em] text-cyan-300">
+                    Discord
+                  </p>
+                  <p className="mt-1 text-sm font-bold text-white">
+                    {discordUser
+                      ? discordUser.global_name || discordUser.username || "Connected"
+                      : "Not connected"}
+                  </p>
+                </div>
+
+                {!discordUser && (
+                  <button
+                    onClick={connectDiscord}
+                    disabled={discordLoading}
+                    className="rounded-2xl bg-cyan-400 px-5 py-3 text-sm font-black uppercase text-black hover:bg-cyan-300 disabled:opacity-60"
+                  >
+                    {discordLoading ? "Checking..." : "Connect Discord"}
+                  </button>
+                )}
+              </div>
+
+              {discordUser && (
+                <div className="mt-4">
+                  <label className="text-xs font-black uppercase tracking-[0.2em] text-zinc-400">
+                    Server To Verify
+                  </label>
+
+                  <select
+                    value={selectedGuildId}
+                    onChange={(e) => handleServerSelect(e.target.value)}
+                    className="mt-2 w-full rounded-2xl border border-zinc-700 bg-black/70 px-4 py-3 text-sm font-bold text-white outline-none"
+                  >
+                    <option value="">Select Discord Server</option>
+                    {guilds.map((guild) => (
+                      <option key={guild.id} value={guild.id}>
+                        {guild.name}
+                      </option>
+                    ))}
+                  </select>
+
+                  {selectedGuildId && (
+                    <p className="mt-2 break-all text-xs text-zinc-500">
+                      Server ID: {selectedGuildId}
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
 
             {!wallet && (
               <div className="mt-6 flex flex-col gap-4">
@@ -406,6 +644,161 @@ export default function Home() {
                 {verifyMessage}
               </div>
             )}
+
+            {scanSummary && (
+              <div className="mt-5 rounded-2xl border border-zinc-800 bg-black/45 p-5">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <p className="text-xs font-black uppercase tracking-[0.25em] text-yellow-300">
+                      Wallet Scan Summary
+                    </p>
+                    <p className="mt-1 text-sm text-zinc-400">
+                      {scanSummary.project_name || "Configured Server"}
+                    </p>
+                  </div>
+
+                  <div className="rounded-xl border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-right">
+                    <p className="text-[10px] font-black uppercase tracking-[0.2em] text-emerald-300">
+                      NFTs Owned
+                    </p>
+                    <p className="text-xl font-black text-white">
+                      {scanSummary.total_nfts_owned ?? 0}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="mt-4 grid gap-3 md:grid-cols-2">
+                  <div className="rounded-xl border border-zinc-800 bg-black/50 p-4">
+                    <p className="text-xs font-black uppercase tracking-[0.2em] text-cyan-300">
+                      Collections Found
+                    </p>
+
+                    <div className="mt-3 space-y-2">
+                      {(scanSummary.collections || []).length === 0 ? (
+                        <p className="text-sm text-zinc-500">No matching collections found.</p>
+                      ) : (
+                        (scanSummary.collections || []).map((collection) => (
+                          <div
+                            key={`${collection.issuer}-${collection.taxon}`}
+                            className="rounded-lg border border-zinc-800 bg-black/50 p-3"
+                          >
+                            <p className="font-black text-white">
+                              {collection.name || `Taxon ${collection.taxon}`}
+                            </p>
+                            <p className="mt-1 text-xs text-zinc-400">
+                              Owned: {collection.owned_count} • Indexed: {collection.indexed_count}
+                            </p>
+                            <p className="mt-1 break-all text-[10px] text-zinc-600">
+                              {collection.issuer}
+                            </p>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="rounded-xl border border-zinc-800 bg-black/50 p-4">
+                    <p className="text-xs font-black uppercase tracking-[0.2em] text-yellow-300">
+                      Traits Found
+                    </p>
+
+                    <div className="mt-3 max-h-72 space-y-2 overflow-auto pr-1">
+                      {(scanSummary.traits || []).length === 0 ? (
+                        <p className="text-sm text-zinc-500">
+                          No indexed traits found for this wallet.
+                        </p>
+                      ) : (
+                        (scanSummary.traits || []).map((trait) => (
+                          <div
+                            key={`${trait.trait_type}-${trait.value}`}
+                            className="flex items-center justify-between gap-3 rounded-lg border border-zinc-800 bg-black/50 px-3 py-2"
+                          >
+                            <p className="text-sm text-zinc-300">
+                              <span className="font-black text-yellow-300">
+                                {trait.trait_type}
+                              </span>
+                              : {trait.value}
+                            </p>
+                            <span className="rounded-full bg-zinc-800 px-2 py-1 text-xs font-black text-white">
+                              {trait.count}
+                            </span>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mt-4 rounded-xl border border-zinc-800 bg-black/50 p-4">
+                  <p className="text-xs font-black uppercase tracking-[0.2em] text-emerald-300">
+                    Role Results
+                  </p>
+
+                  <div className="mt-3 space-y-3">
+                    {(scanSummary.rules || []).length === 0 ? (
+                      <p className="text-sm text-zinc-500">No role rules checked.</p>
+                    ) : (
+                      (scanSummary.rules || []).map((rule) => (
+                        <div
+                          key={rule.role_id}
+                          className={`rounded-xl border p-4 ${
+                            rule.passed
+                              ? "border-emerald-500/40 bg-emerald-500/10"
+                              : "border-red-500/40 bg-red-500/10"
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-3">
+                            <p className="font-black text-white">{rule.role_name}</p>
+                            <span
+                              className={`rounded-full px-3 py-1 text-xs font-black uppercase ${
+                                rule.passed
+                                  ? "bg-emerald-500 text-black"
+                                  : "bg-red-500 text-white"
+                              }`}
+                            >
+                              {rule.passed ? "Passed" : "Failed"}
+                            </span>
+                          </div>
+
+                          <p className="mt-1 text-xs text-zinc-400">
+                            Logic: {rule.logic} — any passing requirement grants this role.
+                          </p>
+
+                          <div className="mt-3 space-y-2">
+                            {rule.requirements.map((req, index) => (
+                              <div
+                                key={`${rule.role_id}-${index}`}
+                                className="rounded-lg border border-zinc-800 bg-black/50 p-3 text-xs"
+                              >
+                                <p
+                                  className={
+                                    req.passed
+                                      ? "font-black text-emerald-300"
+                                      : "font-black text-red-300"
+                                  }
+                                >
+                                  {req.passed ? "✓" : "✕"}{" "}
+                                  {req.requirement_type === "trait"
+                                    ? `Trait: ${req.trait_type} = ${req.trait_value}`
+                                    : `NFT Quantity: ${req.found_count || 0}/${req.required_count || 1}`}
+                                </p>
+
+                                {req.requirement_type === "trait" && (
+                                  <p className="mt-1 text-zinc-400">
+                                    Matching traits: {req.matching_trait_count || 0} • NFTs in collection: {req.found_count || 0}
+                                  </p>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+
           </div>
 
           <div className="rounded-3xl border border-[#3a2b16] bg-[#15110c] p-7 shadow-2xl">

@@ -88,7 +88,22 @@ export async function POST(req: Request) {
       );
     }
 
-    const amountXrp = cleanXrpAmount(project.monthly_xrp_amount);
+    const { data: globalPriceSetting } = await supabase
+      .from("platform_settings")
+      .select("value")
+      .eq("key", "monthly_xrp_amount")
+      .single();
+
+    const globalMonthlyXrp = cleanXrpAmount(
+      globalPriceSetting?.value || DEFAULT_MONTHLY_XRP
+    );
+
+    // Project price still acts as an override if set.
+    // If project.monthly_xrp_amount is null/empty, global setting is used.
+    const amountXrp = cleanXrpAmount(
+      project.monthly_xrp_amount || globalMonthlyXrp
+    );
+
     const amountDrops = xrpToDrops(amountXrp);
 
     const destinationTag =
@@ -192,7 +207,6 @@ export async function POST(req: Request) {
       .update({
         billing_wallet: BILLING_WALLET,
         billing_destination_tag: destinationTag,
-        monthly_xrp_amount: amountXrp,
       })
       .eq("id", project.id);
 
